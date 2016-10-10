@@ -1,0 +1,5 @@
+biopython
+scipy
+numpy
+theano
+pymc3==3.0.rc1
