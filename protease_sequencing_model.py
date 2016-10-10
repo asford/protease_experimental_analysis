@@ -17,7 +17,6 @@ import scipy.stats
 import scipy.optimize
 
 class FractionalSelectionModel(object):
-        
     @staticmethod
     def parent_depth(start_key, pop_specs):
         seen_keys = set()
@@ -75,16 +74,30 @@ class FractionalSelectionModel(object):
         num_members = set( len(p["selected"]) for p in pop_data.values() )
         assert len(num_members) == 1, "Different observed population memberships: %s" % num_members
         num_members = num_members.pop()
+	selected_observations = {
+	    v["selection_level"] : v["selected"]
+	    for v in pop_data.values() if v["selection_level"] is not None 
+	}
+
+	start_ec50 = numpy.full_like(selected_observations.values()[0], min(selected_observations) - 1)
+	for sl in selected_observations:
+	    start_ec50[ ((sl - 1) > start_ec50) & (selected_observations[sl] > 0) ] = sl - 1
         
         self.model = pymc3.Model()
+        
+        self.to_trans = {}
+
         with self.model:
             populations = {}
             
             sel_k = pymc3.Uniform("sel_k", lower=.1, upper=20, testval=1)
-            sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=num_members, testval=0)
-            populations = populations
-            sel_k = sel_k
-            sel_ec50 = sel_ec50
+            sel_k_transform = pymc3.distributions.transforms.Interval(.1, 20).forward(sel_k)
+            self.to_trans["sel_k"] =("sel_k_interval_"), lambda v: sel_k_transform.eval({sel_k : v})
+
+            sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=num_members, testval=start_ec50)
+            sel_ec50_transform = pymc3.distributions.transforms.Interval(-3.0, 9).forward(sel_ec50)
+            self.to_trans["sel_ec50"] = ("sel_ec50_interval_"), lambda v: sel_ec50_transform.eval({sel_ec50 : v})
+
         
             for pkey in sorted(pop_data.keys(), key=lambda pkey: self.parent_depth(pkey, pop_data)):
                 p = pop_data[pkey]
@@ -130,22 +143,40 @@ class FractionalSelectionModel(object):
         self.populations = populations
         self.sel_k = self._function(sel_k)
         self.sel_ec50 = self._function(sel_ec50)
+        self.logpt = self._function(self.model.logpt)
         
         return self
     
-    def find_MAP(self):
-        MAP = pymc3.find_MAP(model=self.model, fmin=scipy.optimize.fmin_l_bfgs_b)
+    def find_MAP(self, start = None):
+        if start is not None:
+            start = self.to_transformed(start)
+            for k in self.model.test_point:
+                if k not in start:
+                    start[k] = self.model.test_point[k]
+        MAP = pymc3.find_MAP(start=start, model=self.model, fmin=scipy.optimize.fmin_l_bfgs_b)
         
         return {
             "sel_k" : self.sel_k(MAP),
             "sel_ec50" : self.sel_ec50(MAP),
         }
     
+    def to_transformed(self, val_dict):
+        r = {}
+        for n, val in val_dict.items():
+            if n in self.to_trans:
+                k, f = self.to_trans[n]
+                r[k] = f(val)
+            else:
+                r[n] = val
+
+        return r
+
     def _function(self, f):
         if isinstance(f, theano.tensor.TensorVariable):
             fn = theano.function(self.model.free_RVs, f, on_unused_input="ignore")
 
             def call_fn(val_dict):
+                val_dict = self.to_transformed(val_dict)
                 return fn(*[val_dict[str(n)] for n in self.model.free_RVs])
 
             return call_fn
@@ -178,9 +209,7 @@ class TestFractionalSelectionModel(unittest.TestCase):
         self.test_model = FractionalSelectionModel()
         self.test_data = self.test_model.generate_data(pop_specs, **self.test_vars)
 
-        pops = self.test_model.build_model( self.test_data )
-
-        test_map = self.test_model.find_MAP()
+        test_map = self.test_model.build_model( self.test_data ).find_MAP()
         
         numpy.testing.assert_allclose( test_map["sel_k"], self.test_vars["sel_k"], rtol=1e-2)
         numpy.testing.assert_allclose( test_map["sel_ec50"], self.test_vars["sel_ec50"], rtol=.3)
