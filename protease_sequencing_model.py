@@ -74,14 +74,14 @@ class FractionalSelectionModel(object):
         num_members = set( len(p["selected"]) for p in pop_data.values() )
         assert len(num_members) == 1, "Different observed population memberships: %s" % num_members
         num_members = num_members.pop()
-	selected_observations = {
-	    v["selection_level"] : v["selected"]
-	    for v in pop_data.values() if v["selection_level"] is not None 
-	}
+        selected_observations = {
+            v["selection_level"] : v["selected"]
+            for v in pop_data.values() if v["selection_level"] is not None 
+        }
 
-	start_ec50 = numpy.full_like(selected_observations.values()[0], min(selected_observations) - 1)
-	for sl in selected_observations:
-	    start_ec50[ ((sl - 1) > start_ec50) & (selected_observations[sl] > 0) ] = sl - 1
+        start_ec50 = numpy.full_like(selected_observations.values()[0], min(selected_observations) - 1)
+        for sl in selected_observations:
+            start_ec50[ ((sl - 1) > start_ec50) & (selected_observations[sl] > 0) ] = sl - 1
         
         self.model = pymc3.Model()
         
@@ -159,6 +159,79 @@ class FractionalSelectionModel(object):
             "sel_k" : self.sel_k(MAP),
             "sel_ec50" : self.sel_ec50(MAP),
         }
+    
+    def ec50_logp_trace(self, base_params, ec50_i, ec50_range, logp_min = numpy.log(1e-5)):
+        work_params = { k : v.copy() for k, v in base_params.items() }
+
+        b_logp = self.logpt(work_params)
+
+        results = numpy.full_like(ec50_range, -numpy.inf)
+
+        # Optimization to improve evaluation times.
+        # Model probability monotonically decreases w/ difference from
+        # map estimate, so scan outward from the map estimate until
+        # lower logp threashold is reached. Fill remaining values w/ -inf.
+
+        map_i = numpy.searchsorted(ec50_range, base_params["sel_ec50"][ec50_i])
+
+        for i in range(map_i, len(ec50_range)):
+            v = ec50_range[i]
+            work_params["sel_ec50"][ec50_i] = v
+            vlogp = self.logpt(work_params)
+            if not numpy.isfinite(vlogp):
+                vlogp = -numpy.inf
+            delta_log = vlogp - b_logp
+            results[i] = delta_log
+            if delta_log < logp_min:
+                break
+
+        for i in range(map_i - 1, -1, -1):
+            v = ec50_range[i]
+            work_params["sel_ec50"][ec50_i] = v
+            vlogp = self.logpt(work_params)
+            if not numpy.isfinite(vlogp):
+                vlogp = -numpy.inf
+            delta_log = vlogp - b_logp
+            results[i] = delta_log
+            if delta_log < logp_min:
+                break
+
+        return results
+
+    def estimate_ec50_cred(self, base_params, ec50_i, cred_spans = [.68, .95]):
+        """Estimate EC50 credible interval for a single ec50 parameter via model probability."""
+        xs = numpy.arange(-3.1, 9, .1)
+        logp = numpy.nan_to_num(self.ec50_logp_trace(base_params, ec50_i, xs))
+        pmf = numpy.exp(logp) / numpy.sum(numpy.exp(logp))
+        cdf = numpy.cumsum(pmf)
+
+        cred_intervals = {}
+        for cred_i in cred_spans:
+            cdf_b = (1 - cred_i) / 2
+            l_b = xs[numpy.searchsorted(cdf, cdf_b, side="left")]
+            u_b = xs[numpy.searchsorted(cdf, 1 - cdf_b, side="right")]
+            cred_intervals[cred_i] = (l_b, u_b)
+
+        return dict(
+            xs = xs,
+            pmf = pmf,
+            cdf = cdf,
+            map_e = base_params["sel_ec50"][ec50_i],
+            cred_intervals = cred_intervals
+        )
+
+    @staticmethod
+    def plot_cred_summary(ec50_cred, ax=None):
+        if ax is None:
+            from matplotlib import pylab
+            ax = pylab.gca()
+
+        ax.plot( ec50_cred["xs"], ec50_cred["pmf"], label="pmf" )
+        ax.plot( ec50_cred["xs"], ec50_cred["cdf"], label="cdf" )
+        ax.axvline(ec50_cred["map_e"], alpha=.5, label="MAP")
+
+        for ci, (cl, cu) in ec50_cred["cred_intervals"].items():
+            ax.axvspan(cl, cu, color="red", alpha=.2, label="%.2f cred" % ci)
     
     def to_transformed(self, val_dict):
         r = {}
