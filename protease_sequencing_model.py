@@ -252,10 +252,10 @@ class FractionalSelectionModel(object):
         }
 
     def model_outlier_summary(self, params):
-        selection_summary = model_selection_summary(self, params)
+        selection_summary = self.model_selection_summary(params)
 
         for v in selection_summary.values():
-            cdf = stats.binom.cdf(
+            cdf = scipy.stats.binom.cdf(
                 v["selected"],
                 n=v["selected"].sum(),
                 p=v["pop_fraction"])
