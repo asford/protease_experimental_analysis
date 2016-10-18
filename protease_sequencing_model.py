@@ -69,14 +69,14 @@ class FractionalSelectionModel(object):
             
         return populations
     
-    def build_model(self, pop_data):
+    def build_model(self, population_data):
         
-        num_members = set( len(p["selected"]) for p in pop_data.values() )
+        num_members = set( len(p["selected"]) for p in population_data.values() )
         assert len(num_members) == 1, "Different observed population memberships: %s" % num_members
-        num_members = num_members.pop()
+        self.num_members = num_members.pop()
         selected_observations = {
             v["selection_level"] : v["selected"]
-            for v in pop_data.values() if v["selection_level"] is not None 
+            for v in population_data.values() if v["selection_level"] is not None 
         }
 
         start_ec50 = numpy.full_like(selected_observations.values()[0], min(selected_observations) - 1)
@@ -86,29 +86,35 @@ class FractionalSelectionModel(object):
         self.model = pymc3.Model()
         
         self.to_trans = {}
+        
+        self.model_populations = {}
+        self.population_data = population_data
 
         with self.model:
-            populations = {}
             
             sel_k = pymc3.Uniform("sel_k", lower=.1, upper=20, testval=1)
             sel_k_transform = pymc3.distributions.transforms.Interval(.1, 20).forward(sel_k)
             self.to_trans["sel_k"] =("sel_k_interval_"), lambda v: sel_k_transform.eval({sel_k : v})
 
-            sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=num_members, testval=start_ec50)
+            sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=self.num_members, testval=start_ec50)
             sel_ec50_transform = pymc3.distributions.transforms.Interval(-3.0, 9).forward(sel_ec50)
             self.to_trans["sel_ec50"] = ("sel_ec50_interval_"), lambda v: sel_ec50_transform.eval({sel_ec50 : v})
 
         
-            for pkey in sorted(pop_data.keys(), key=lambda pkey: self.parent_depth(pkey, pop_data)):
-                p = pop_data[pkey]
-                if p["parent"] is None:
+            pops_by_depth = sorted(
+                population_data.keys(),
+                key=lambda pkey: self.parent_depth(pkey, population_data)) 
+            
+            for pkey in pops_by_depth:
+                pdat = population_data[pkey]
+                if pdat["parent"] is None:
                     continue
                 else:
-                    start_pop = pop_data[p["parent"]]["selected"].astype(float)
+                    start_pop = population_data[pdat["parent"]]["selected"].astype(float)
 
                 start_dist = start_pop / start_pop.sum()
-                if p["selection_level"] is not None:
-                    selection_dist = start_dist / (1 + T.exp(sel_k * (T.constant(p["selection_level"]) - sel_ec50)))
+                if pdat["selection_level"] is not None:
+                    selection_dist = start_dist / (1 + T.exp(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50)))
                     fraction_selected = selection_dist.sum() / start_dist.sum()
                 else:
                     selection_dist = start_dist
@@ -117,33 +123,32 @@ class FractionalSelectionModel(object):
                 pop_mask = numpy.flatnonzero(start_pop > 0)  #multinomial formula returns nan if any p == 0, file bug?
                 selected = pymc3.distributions.Multinomial(
                     name = "selected_%s" % pkey,
-                    n=p["selected"][pop_mask].sum(),
+                    n=pdat["selected"][pop_mask].sum(),
                     p=(selection_dist / selection_dist.sum())[pop_mask],
-                    observed=p["selected"][pop_mask]
+                    observed=pdat["selected"][pop_mask]
                 )
                 
-                if p.get("fraction_selected", None) is not None:
-                    selected_count = p["selected"].sum()
-                    source_count = numpy.floor(float(selected_count) / p["fraction_selected"])
+                if pdat.get("fraction_selected", None) is not None:
+                    selected_count = pdat["selected"].sum()
+                    source_count = numpy.floor(float(selected_count) / pdat["fraction_selected"])
                     total_selected = pymc3.distributions.Binomial(
                         name = "total_selected_%s" % pkey,
                         n = source_count,
                         p = fraction_selected,
                         observed = selected_count)
                 else:
-                    total_selected = p["selected"].sum()
+                    total_selected = pdat["selected"].sum()
                     
-                populations[pkey] = {
+                self.model_populations[pkey] = {
                     "selection_dist" : self._function(selection_dist),
                     "fraction_selected" : self._function(fraction_selected),
                     "selected" : self._function(selected),
                     "total_selected" : self._function(total_selected),
                 }
                 
-        self.populations = populations
         self.sel_k = self._function(sel_k)
         self.sel_ec50 = self._function(sel_ec50)
-        self.logpt = self._function(self.model.logpt)
+        self.logp = self._function(self.model.logpt)
         
         return self
     
@@ -163,7 +168,7 @@ class FractionalSelectionModel(object):
     def ec50_logp_trace(self, base_params, ec50_i, ec50_range, logp_min = numpy.log(1e-5)):
         work_params = { k : v.copy() for k, v in base_params.items() }
 
-        b_logp = self.logpt(work_params)
+        b_logp = self.logp(work_params)
 
         results = numpy.full_like(ec50_range, -numpy.inf)
 
@@ -177,7 +182,7 @@ class FractionalSelectionModel(object):
         for i in range(map_i, len(ec50_range)):
             v = ec50_range[i]
             work_params["sel_ec50"][ec50_i] = v
-            vlogp = self.logpt(work_params)
+            vlogp = self.logp(work_params)
             if not numpy.isfinite(vlogp):
                 vlogp = -numpy.inf
             delta_log = vlogp - b_logp
@@ -188,7 +193,7 @@ class FractionalSelectionModel(object):
         for i in range(map_i - 1, -1, -1):
             v = ec50_range[i]
             work_params["sel_ec50"][ec50_i] = v
-            vlogp = self.logpt(work_params)
+            vlogp = self.logp(work_params)
             if not numpy.isfinite(vlogp):
                 vlogp = -numpy.inf
             delta_log = vlogp - b_logp
@@ -232,6 +237,32 @@ class FractionalSelectionModel(object):
 
         for ci, (cl, cu) in ec50_cred["cred_intervals"].items():
             ax.axvspan(cl, cu, color="red", alpha=.2, label="%.2f cred" % ci)
+            
+    def model_selection_summary(self, params):
+        def normed_pop(v):
+            return v / v.sum()
+
+        return {
+            pkey : {
+                "selected"  : self.population_data[pkey]["selected"],
+                "selected_fraction" : normed_pop(self.population_data[pkey]["selected"].astype(float)),
+                "pop_fraction" : normed_pop(self.model_populations[pkey]["selection_dist"](params))
+            }
+            for pkey in self.model_populations
+        }
+
+    def model_outlier_summary(self, params):
+        selection_summary = model_selection_summary(self, params)
+
+        for v in selection_summary.values():
+            cdf = stats.binom.cdf(
+                v["selected"],
+                n=v["selected"].sum(),
+                p=v["pop_fraction"])
+            sel_llh = numpy.log(numpy.where(cdf > .5, 1 - cdf, cdf) * 2)
+            v["sel_log_likelihood"] = numpy.where(sel_llh != -numpy.inf, sel_llh, numpy.nan)
+
+        return selection_summary
     
     def to_transformed(self, val_dict):
         r = {}
