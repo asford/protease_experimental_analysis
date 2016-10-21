@@ -2,6 +2,10 @@
 
 from __future__ import division
 
+import logging
+logger = logging.getLogger(__name__)
+
+import copy
 import numpy
 
 import theano.tensor as T
@@ -17,6 +21,16 @@ import scipy.stats
 import scipy.optimize
 
 class FractionalSelectionModel(object):
+    def __init__(self, homogenous_k=True):
+        self.homogenous_k = homogenous_k
+        
+    @staticmethod
+    def lognorm_params(sd, mode):
+        return dict(
+            tau = sd**-2.,
+            mu = numpy.log(mode) + sd ** 2,
+        )
+    
     @staticmethod
     def parent_depth(start_key, pop_specs):
         seen_keys = set()
@@ -70,7 +84,11 @@ class FractionalSelectionModel(object):
         return populations
     
     def build_model(self, population_data):
-        
+        for k, p in population_data.items():
+            unused_keys = set(p.keys()).difference( {"selected", "fraction_selected", "selection_level", "parent"} )
+            if unused_keys:
+                logger.warning("Unused keys in population_data[%r] : %s", k, unused_keys)
+                
         num_members = set( len(p["selected"]) for p in population_data.values() )
         assert len(num_members) == 1, "Different observed population memberships: %s" % num_members
         self.num_members = num_members.pop()
@@ -91,11 +109,14 @@ class FractionalSelectionModel(object):
         self.population_data = population_data
 
         with self.model:
+            sel_k = pymc3.Lognormal( "sel_k",
+                shape=1 if self.homogenous_k else self.num_members,
+                tau=self.lognorm_params(sd=.2, mode=1.5)["tau"],
+                mu=self.lognorm_params(sd=.2, mode=1.5)["mu"],
+                testval=1.5)
+            sel_k_transform = pymc3.distributions.transforms.log.forward(sel_k)
+            self.to_trans["sel_k"] = ("sel_k_log_"), lambda v: sel_k_transform.eval({sel_k : v})
             
-            sel_k = pymc3.Uniform("sel_k", lower=.1, upper=20, testval=1)
-            sel_k_transform = pymc3.distributions.transforms.Interval(.1, 20).forward(sel_k)
-            self.to_trans["sel_k"] =("sel_k_interval_"), lambda v: sel_k_transform.eval({sel_k : v})
-
             sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=self.num_members, testval=start_ec50)
             sel_ec50_transform = pymc3.distributions.transforms.Interval(-3.0, 9).forward(sel_ec50)
             self.to_trans["sel_ec50"] = ("sel_ec50_interval_"), lambda v: sel_ec50_transform.eval({sel_ec50 : v})
@@ -202,7 +223,7 @@ class FractionalSelectionModel(object):
                 break
 
         return results
-
+    
     def estimate_ec50_cred(self, base_params, ec50_i, cred_spans = [.68, .95]):
         """Estimate EC50 credible interval for a single ec50 parameter via model probability."""
         xs = numpy.arange(-3.1, 9, .1)
