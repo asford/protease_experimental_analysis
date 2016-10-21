@@ -173,7 +173,8 @@ class FractionalSelectionModel(object):
         
         return self
     
-    def find_MAP(self, start = None):
+    def optimize_params(self, start = None):
+        logger.info("optimize_params: %i members", self.num_members)
         if start is not None:
             start = self.to_transformed(start)
             for k in self.model.test_point:
@@ -186,10 +187,39 @@ class FractionalSelectionModel(object):
             "sel_ec50" : self.sel_ec50(MAP),
         }
     
+    def opt_ec50_cred_outliers(self, src_params):
+        logger.info("scan_ec50_outliers: %i members", self.num_members)
+        params = copy.deepcopy(src_params)
+
+        num_outlier = 0
+        for i in range(self.num_members):
+            if i % 1000 == 0:
+                logger.info("scan_ec50_outliers: %i / %i", i, self.num_members)
+                
+            cred_summary = self.estimate_ec50_cred(params, i)
+            lb = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "left")
+            rb = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "right")
+
+            m_pmf = cred_summary["pmf"].argmax()
+
+            if m_pmf < lb or m_pmf > rb:
+                num_outlier += 1
+                params["sel_ec50"][i] = cred_summary["xs"][m_pmf]
+
+        logger.info(
+            "Modified %.3f outliers. (%i/%i)",
+             num_outlier / self.num_members, num_outlier, self.num_members)
+    
+        return params
+    
+    def find_MAP(self, start = None):
+        init = self.optimize_params(start)
+        resampled = self.opt_ec50_cred_outliers(init)
+        
+        return self.optimize_params(resampled)
+    
     def ec50_logp_trace(self, base_params, ec50_i, ec50_range, logp_min = numpy.log(1e-5)):
         work_params = { k : v.copy() for k, v in base_params.items() }
-
-        b_logp = self.logp(work_params)
 
         results = numpy.full_like(ec50_range, -numpy.inf)
 
@@ -199,6 +229,7 @@ class FractionalSelectionModel(object):
         # lower logp threashold is reached. Fill remaining values w/ -inf.
 
         map_i = numpy.searchsorted(ec50_range, base_params["sel_ec50"][ec50_i])
+        b_logp = self.logp(work_params)
 
         for i in range(map_i, len(ec50_range)):
             v = ec50_range[i]
@@ -206,9 +237,12 @@ class FractionalSelectionModel(object):
             vlogp = self.logp(work_params)
             if not numpy.isfinite(vlogp):
                 vlogp = -numpy.inf
+            results[i] = vlogp
+
             delta_log = vlogp - b_logp
-            results[i] = delta_log
-            if delta_log < logp_min:
+            if delta_log > 0:
+                b_logp = vlogp
+            elif delta_log < logp_min:
                 break
 
         for i in range(map_i - 1, -1, -1):
@@ -217,12 +251,15 @@ class FractionalSelectionModel(object):
             vlogp = self.logp(work_params)
             if not numpy.isfinite(vlogp):
                 vlogp = -numpy.inf
+            results[i] = vlogp
+
             delta_log = vlogp - b_logp
-            results[i] = delta_log
-            if delta_log < logp_min:
+            if delta_log > 0:
+                b_logp = vlogp 
+            elif delta_log < logp_min:
                 break
 
-        return results
+        return results - b_logp
     
     def estimate_ec50_cred(self, base_params, ec50_i, cred_spans = [.68, .95]):
         """Estimate EC50 credible interval for a single ec50 parameter via model probability."""
@@ -242,7 +279,7 @@ class FractionalSelectionModel(object):
             xs = xs,
             pmf = pmf,
             cdf = cdf,
-            map_e = base_params["sel_ec50"][ec50_i],
+            sel_ec50 = base_params["sel_ec50"][ec50_i],
             cred_intervals = cred_intervals
         )
 
@@ -254,7 +291,7 @@ class FractionalSelectionModel(object):
 
         ax.plot( ec50_cred["xs"], ec50_cred["pmf"], label="pmf" )
         ax.plot( ec50_cred["xs"], ec50_cred["cdf"], label="cdf" )
-        ax.axvline(ec50_cred["map_e"], alpha=.5, label="MAP")
+        ax.axvline(ec50_cred["sel_ec50"], alpha=.5, label="sel_e50: %.2f" % ec50_cred["sel_ec50"])
 
         for ci, (cl, cu) in ec50_cred["cred_intervals"].items():
             ax.axvspan(cl, cu, color="red", alpha=.2, label="%.2f cred" % ci)
