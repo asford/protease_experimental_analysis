@@ -320,6 +320,9 @@ class FractionalSelectionModel(object):
             sel_llh = numpy.log(numpy.where(cdf > .5, 1 - cdf, cdf) * 2)
             v["sel_log_likelihood"] = numpy.where(sel_llh != -numpy.inf, sel_llh, numpy.nan)
 
+            sel_error = (v["selected"] / v["selected"].sum()) - v["pop_fraction"]
+            v["sel_log_likelihood_signed"] = -v["sel_log_likelihood"] * (sel_error / numpy.abs(sel_error))
+            
         return selection_summary
     
     def to_transformed(self, val_dict):
