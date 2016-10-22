@@ -313,14 +313,21 @@ class FractionalSelectionModel(object):
         selection_summary = self.model_selection_summary(params)
 
         for v in selection_summary.values():
-            cdf = scipy.stats.binom.cdf(
+            logpmf = scipy.stats.binom.logpmf(
                 v["selected"],
                 n=v["selected"].sum(),
                 p=v["pop_fraction"])
-            sel_llh = numpy.log(numpy.where(cdf > .5, 1 - cdf, cdf) * 2)
+            
+            max_logpmf = scipy.stats.binom.logpmf(
+                numpy.round(v["selected"].sum() * v["pop_fraction"]),
+                n=v["selected"].sum(),
+                p=v["pop_fraction"])
+
+            sel_llh = logpmf - max_logpmf
             v["sel_log_likelihood"] = numpy.where(sel_llh != -numpy.inf, sel_llh, numpy.nan)
 
-        return selection_summary
+            sel_error = (v["selected"] / v["selected"].sum()) - v["pop_fraction"]
+            v["sel_log_likelihood_signed"] = -v["sel_log_likelihood"] * numpy.sign(sel_error) 
     
     def to_transformed(self, val_dict):
         r = {}
