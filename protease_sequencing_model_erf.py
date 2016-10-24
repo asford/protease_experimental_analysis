@@ -137,7 +137,7 @@ class FractionalSelectionModel(object):
 
 
                     fraction_selected = selection_dist.sum() / start_dist.sum()
-                    if pdat["min_fraction"] is not None:
+                    if pdat.get("min_fraction") is not None:
                         selection_dist = T.clip(selection_dist, T.constant(pdat["min_fraction"]) * selection_dist.sum(), T.constant(1.0))
 
                 else:
