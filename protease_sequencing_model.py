@@ -21,9 +21,22 @@ import scipy.stats
 import scipy.optimize
 
 class FractionalSelectionModel(object):
-    def __init__(self, homogenous_k=True):
+    response_impl = {
+        "scipy" : {
+            "expit" : lambda xs: 1 - scipy.special.expit(xs),
+            "erf" : lambda xs : 1 - ((scipy.special.erf(xs / 2) + 1) / 2)},
+        "theano" : {
+            "expit" : lambda xs: 1 - 1 / (1 + T.exp(-xs)),
+            "erf" : lambda xs : 1 - ((T.erf(xs / 2) + 1) / 2)},
+    }
+
+    def __init__(self, response_fn, homogenous_k=True):
+        self.response_fn = response_fn
         self.homogenous_k = homogenous_k
-        
+
+        for k in self.response_impl:
+            assert self.response_fn in self.response_impl[k]
+
     @staticmethod
     def lognorm_params(sd, mode):
         return dict(
@@ -66,7 +79,8 @@ class FractionalSelectionModel(object):
                 
             start_dist = start_pop / start_pop.sum()
             if p["selection_level"] is not None:
-                src_dist = start_dist / (1 + numpy.exp(sel_k * (p["selection_level"] - sel_ec50)))
+                rf = self.response_impl["scipy"][self.response_fn]
+                src_dist = start_dist * rf(sel_k * (p["selection_level"] - sel_ec50))
                 fraction_selected = src_dist.sum() / start_dist.sum()
             else:
                 src_dist = start_dist
@@ -135,7 +149,8 @@ class FractionalSelectionModel(object):
 
                 start_dist = start_pop / start_pop.sum()
                 if pdat["selection_level"] is not None:
-                    selection_dist = start_dist / (1 + T.exp(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50)))
+                    rf = self.response_impl["theano"][self.response_fn]
+                    selection_dist = start_dist * rf(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50))
                     fraction_selected = selection_dist.sum() / start_dist.sum()
                 else:
                     selection_dist = start_dist
@@ -355,17 +370,16 @@ class FractionalSelectionModel(object):
 import unittest
 
 class TestFractionalSelectionModel(unittest.TestCase):
-    def test_basic_model(self):
+    def setUp(self):
         numpy.random.seed(1663)
         
         test_members = 10
-        num_sampled = 1e3
-        pop_specs= {
-            g : dict(parent = g - 1, selection_level = g, selected = num_sampled)
-            for g in range(1, 7)
-        }
-        pop_specs[0] = dict(parent = None, selection_level = None, selected = num_sampled)
-
+        num_sampled = 1e4
+        self.pop_specs = dict(
+            [(0, dict(parent = None, selection_level = None, selected = num_sampled))] +
+            [(g, dict(parent = g - 1, selection_level = g, selected = num_sampled))
+                for g in range(1, 7)]
+        )
         self.test_vars = {
             "sel_k" : 1.5,
             "sel_ec50" : numpy.concatenate((
@@ -375,10 +389,14 @@ class TestFractionalSelectionModel(unittest.TestCase):
             "init_pop" : numpy.random.lognormal(size=test_members)
         }
 
-        self.test_model = FractionalSelectionModel()
-        self.test_data = self.test_model.generate_data(pop_specs, **self.test_vars)
 
-        test_map = self.test_model.build_model( self.test_data ).find_MAP()
-        
-        numpy.testing.assert_allclose( test_map["sel_k"], self.test_vars["sel_k"], rtol=1e-2)
-        numpy.testing.assert_allclose( test_map["sel_ec50"], self.test_vars["sel_ec50"], rtol=.3)
+    def test_basic_model(self):
+        for rf in ("expit", "erf"):
+
+            self.test_model = FractionalSelectionModel(response_fn = rf, homogenous_k=True)
+            self.test_data = self.test_model.generate_data(self.pop_specs, **self.test_vars)
+
+            test_map = self.test_model.build_model( self.test_data ).find_MAP()
+            
+            numpy.testing.assert_allclose( test_map["sel_k"], self.test_vars["sel_k"], rtol=1e-2, atol=.025)
+            numpy.testing.assert_allclose( test_map["sel_ec50"], self.test_vars["sel_ec50"], rtol=.3)
