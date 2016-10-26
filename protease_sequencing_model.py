@@ -351,6 +351,8 @@ class FractionalSelectionModel(object):
 
             sel_error = (v["selected"] / v["selected"].sum()) - v["pop_fraction"]
             v["sel_log_likelihood_signed"] = -v["sel_log_likelihood"] * numpy.sign(sel_error) 
+
+        return selection_summary
     
     def to_transformed(self, val_dict):
         r = {}
