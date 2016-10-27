@@ -20,6 +20,9 @@ import scipy.stats.distributions
 import scipy.stats
 import scipy.optimize
 
+def unorm(v):
+    return v / v.sum()
+
 class FractionalSelectionModel(object):
     response_impl = {
         "scipy" : {
@@ -30,9 +33,10 @@ class FractionalSelectionModel(object):
             "erf" : lambda xs : 1 - ((T.erf(xs / 2) + 1) / 2)},
     }
 
-    def __init__(self, response_fn, homogenous_k=True):
+    def __init__(self, leak_prob_mass=True, response_fn="expit", homogenous_k=True):
         self.response_fn = response_fn
         self.homogenous_k = homogenous_k
+        self.leak_prob_mass = leak_prob_mass
 
         for k in self.response_impl:
             assert self.response_fn in self.response_impl[k]
@@ -77,7 +81,7 @@ class FractionalSelectionModel(object):
             else:
                 start_pop = populations[p["parent"]]["selected"]
                 
-            start_dist = start_pop / start_pop.sum()
+            start_dist = unorm(start_pop)
             if p["selection_level"] is not None:
                 rf = self.response_impl["scipy"][self.response_fn]
                 src_dist = start_dist * rf(sel_k * (p["selection_level"] - sel_ec50))
@@ -86,7 +90,7 @@ class FractionalSelectionModel(object):
                 src_dist = start_dist
                 fraction_selected = 1
                 
-            selected = numpy.random.multinomial(p["selected"], src_dist / src_dist.sum()).astype(float)
+            selected = numpy.random.multinomial(p["selected"], unorm(src_dist)).astype(float)
             
             populations[pkey] = {}
             populations[pkey].update(p)
@@ -97,6 +101,21 @@ class FractionalSelectionModel(object):
             
         return populations
     
+    def add_fit_param(self, name, dist):
+        var = self.model.Var(name, dist, data=None)
+
+        if dist.transform:
+            forward_trans = dist.transform.forward(var)
+            self.to_trans[name] = (
+                "%s_%s_" % (name, dist.transform.name),
+                lambda v: forward_trans.eval({var : v})
+            ) 
+
+
+        self.fit_params[name] = var
+
+        return var
+
     def build_model(self, population_data):
         for k, p in population_data.items():
             unused_keys = set(p.keys()).difference( {"selected", "fraction_selected", "selection_level", "parent"} )
@@ -118,26 +137,32 @@ class FractionalSelectionModel(object):
         self.model = pymc3.Model()
         
         self.to_trans = {}
+        self.fit_params = {}
         
         self.model_populations = {}
         self.population_data = population_data
 
         with self.model:
-            sel_k = pymc3.Uniform("sel_k",
-                shape=1 if self.homogenous_k else self.num_members,
-                lower=0.1, upper=9.0,
-                testval=1.5
-            )
-            sel_k_transform = pymc3.distributions.transforms.Interval(.1, 9).forward(sel_k)
-            self.to_trans["sel_k"] = ("sel_k_interval_"), lambda v: sel_k_transform.eval({sel_k : v})
+            sel_k = self.add_fit_param(
+                "sel_k",
+                pymc3.Uniform.dist(
+                    shape=1 if self.homogenous_k else self.num_members,
+                    lower=0.1, upper=9.0,
+                    testval=1.5
+            ))
             
-            sel_ec50 = pymc3.Uniform("sel_ec50", lower=-3.0, upper=9.0, shape=self.num_members, testval=start_ec50)
-            sel_ec50_transform = pymc3.distributions.transforms.Interval(-3.0, 9).forward(sel_ec50)
-            self.to_trans["sel_ec50"] = ("sel_ec50_interval_"), lambda v: sel_ec50_transform.eval({sel_ec50 : v})
+            sel_ec50 = self.add_fit_param(
+                "sel_ec50",
+                pymc3.Uniform.dist(
+                    shape=self.num_members,
+                    lower=-3.0, upper=9.0,
+                    testval=start_ec50)
+                )
 
-            uniform_mass = pymc3.HalfNormal("uniform_mass", sd=.1, testval=.01)
-            uniform_mass_transform = pymc3.distributions.transforms.log.forward(uniform_mass)
-            self.to_trans["uniform_mass"] = ("uniform_mass_log_"), lambda v: uniform_mass_transform.eval({uniform_mass : v})
+            if self.leak_prob_mass:
+                min_prob_mass = self.add_fit_param(
+                    "min_prob_mass",
+                    pymc3.HalfNormal.dist(sd=.1, testval=.05))
         
             pops_by_depth = sorted(
                 population_data.keys(),
@@ -150,23 +175,25 @@ class FractionalSelectionModel(object):
                 else:
                     start_pop = population_data[pdat["parent"]]["selected"].astype(float)
 
-                start_dist = start_pop / start_pop.sum()
+                start_dist = unorm(start_pop)
                 if pdat["selection_level"] is not None:
                     rf = self.response_impl["theano"][self.response_fn]
-                    selection_dist = start_dist * rf(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50))
+                    selection_mass = rf(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50))
+                    if self.leak_prob_mass:
+                        selection_mass = min_prob_mass + (selection_mass * (1 - min_prob_mass))
+
+                    selection_dist = start_dist * selection_mass
                     fraction_selected = selection_dist.sum() / start_dist.sum()
                 else:
                     selection_dist = start_dist
                     fraction_selected = 1.0
                 
                 pop_mask = numpy.flatnonzero(start_pop > 0)  #multinomial formula returns nan if any p == 0, file bug?
-                def unorm(v):
-                    return v / v.sum()
 
                 selected = pymc3.distributions.Multinomial(
                     name = "selected_%s" % pkey,
                     n=pdat["selected"][pop_mask].sum(),
-                    p=unorm(unorm(selection_dist)[pop_mask] + (uniform_mass / len(pop_mask))),
+                    p=unorm(selection_dist)[pop_mask],
                     observed=pdat["selected"][pop_mask]
                 )
                 
@@ -182,15 +209,14 @@ class FractionalSelectionModel(object):
                     total_selected = pdat["selected"].sum()
                     
                 self.model_populations[pkey] = {
+                    "selection_mass" : self._function(selection_mass),
                     "selection_dist" : self._function(selection_dist),
                     "fraction_selected" : self._function(fraction_selected),
                     "selected" : self._function(selected),
                     "total_selected" : self._function(total_selected),
                 }
                 
-        self.sel_k = self._function(sel_k)
-        self.sel_ec50 = self._function(sel_ec50)
-        self.uniform_mass = self._function(uniform_mass)
+        self.fit_params = { k : self._function(v) for k, v in self.fit_params.items() }
         self.logp = self._function(self.model.logpt)
         
         return self
@@ -204,11 +230,7 @@ class FractionalSelectionModel(object):
                     start[k] = self.model.test_point[k]
         MAP = pymc3.find_MAP(start=start, model=self.model, fmin=scipy.optimize.fmin_l_bfgs_b)
         
-        return {
-            "sel_k" : self.sel_k(MAP),
-            "sel_ec50" : self.sel_ec50(MAP),
-            "uniform_mass" : self.uniform_mass(MAP)
-        }
+        return { k : v(MAP) for k, v in self.fit_params.items() }
     
     def opt_ec50_cred_outliers(self, src_params):
         logger.info("scan_ec50_outliers: %i members", self.num_members)
