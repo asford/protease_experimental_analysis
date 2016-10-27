@@ -150,13 +150,22 @@ class FractionalSelectionModel(object):
                     lower=0.1, upper=9.0,
                     testval=1.5
             ))
+
+            sel_values = set(
+                float(p["selection_level"])
+                for p in self.population_data.values()
+                if p["selection_level"] is not None
+            )
+            sel_mag = max(sel_values) - min(sel_values)
+            sel_range = dict(lower=min(sel_values) - sel_mag * .5, upper=max(sel_values)+sel_mag*.5)
+            logger.info("Inferred sel_ec50 range: %s", sel_range)
             
             sel_ec50 = self.add_fit_param(
                 "sel_ec50",
                 pymc3.Uniform.dist(
                     shape=self.num_members,
-                    lower=-3.0, upper=9.0,
-                    testval=start_ec50)
+                    testval=start_ec50,
+                    **sel_range)
                 )
 
             if self.leak_prob_mass:
