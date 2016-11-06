@@ -157,15 +157,15 @@ class FractionalSelectionModel(object):
                 if p["selection_level"] is not None
             )
             sel_mag = max(sel_values) - min(sel_values)
-            sel_range = dict(lower=min(sel_values) - sel_mag * .5, upper=max(sel_values)+sel_mag*.5)
-            logger.info("Inferred sel_ec50 range: %s", sel_range)
+            self.sel_range = dict(lower=min(sel_values) - sel_mag * .5, upper=max(sel_values)+sel_mag*.5)
+            logger.info("Inferred sel_ec50 range: %s", self.sel_range)
             
             sel_ec50 = self.add_fit_param(
                 "sel_ec50",
                 pymc3.Uniform.dist(
                     shape=self.num_members,
                     testval=start_ec50,
-                    **sel_range)
+                    **self.sel_range)
                 )
 
             if self.leak_prob_mass:
@@ -251,73 +251,93 @@ class FractionalSelectionModel(object):
                 logger.info("scan_ec50_outliers: %i / %i", i, self.num_members)
                 
             cred_summary = self.estimate_ec50_cred(params, i)
-            lb = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "left")
-            rb = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "right")
 
-            m_pmf = cred_summary["pmf"].argmax()
+            xs = cred_summary["xs"]
+            cdf = cred_summary["cdf"]
 
-            if m_pmf < lb or m_pmf > rb:
+            cur_i = numpy.searchsorted(xs, params["sel_ec50"][i])
+            l_b = numpy.searchsorted(cdf, .25, side="left")
+            u_b = numpy.searchsorted(cdf, .75, side="right")
+
+            if cur_i < l_b or cur_i > u_b:
                 num_outlier += 1
-                params["sel_ec50"][i] = cred_summary["xs"][m_pmf]
+                params["sel_ec50"][i] = cred_summary["xs"][int((l_b + u_b) / 2)]
 
         logger.info(
             "Modified %.3f outliers. (%i/%i)",
              num_outlier / self.num_members, num_outlier, self.num_members)
+
+        #Clip back into range of src_params to avoid issues with model parameter ranges.
+        params["sel_ec50"] = numpy.clip(params["sel_ec50"], src_params["sel_ec50"].min(), src_params["sel_ec50"].max())
     
         return params
     
     def find_MAP(self, start = None):
         init = self.optimize_params(start)
         resampled = self.opt_ec50_cred_outliers(init)
-        
-        return self.optimize_params(resampled)
+        final = self.optimize_params(resampled)
+        return final
     
-    def ec50_logp_trace(self, base_params, ec50_i, ec50_range, logp_min = numpy.log(1e-5)):
-        work_params = { k : v.copy() for k, v in base_params.items() }
+    def ec50_logp_trace(self, base_params, sample_i, ec50_range, include_global_terms=True):
+        llh_by_ec50_gen = numpy.zeros((len(ec50_range), len(self.model_populations)))
+        
+        for pkey_n, pkey in enumerate(self.model_populations):
+            
+            pdat = self.population_data[pkey]
+            
+            parent_pop_fraction = unorm(self.population_data[pdat['parent']]['selected'])[sample_i]
+            
+            if parent_pop_fraction == 0:
+                continue
 
-        results = numpy.full_like(ec50_range, -numpy.inf)
+            # calculate selection results for full ec50 range
+            selected_fraction = self.response_impl["scipy"][self.response_fn](
+                # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - ec50_range) - 1.0 ))
+                base_params['sel_k'] * (pdat["selection_level"] - ec50_range))
 
-        # Optimization to improve evaluation times.
-        # Model probability monotonically decreases w/ difference from
-        # map estimate, so scan outward from the map estimate until
-        # lower logp threashold is reached. Fill remaining values w/ -inf.
+            
+            sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]['fraction_selected'](base_params)
+            
+            # if pdat['min_fraction'] != None:
+                # sel_pop_fraction = numpy.clip(sel_pop_fraction, min=ppdat['min_fraction'], max=None)
 
-        map_i = numpy.searchsorted(ec50_range, base_params["sel_ec50"][ec50_i])
-        b_logp = self.logp(work_params)
+            sample_llhs = scipy.stats.binom.logpmf(
+                pdat['selected'][sample_i],
+                n=pdat['num_selected'],
+                p=sel_pop_fraction)
 
-        for i in range(map_i, len(ec50_range)):
-            v = ec50_range[i]
-            work_params["sel_ec50"][ec50_i] = v
-            vlogp = self.logp(work_params)
-            if not numpy.isfinite(vlogp):
-                vlogp = -numpy.inf
-            results[i] = vlogp
+            if include_global_terms and pdat.get("fraction_selected") is not None:
+                prev_selected_fraction = self.response_impl["scipy"][self.response_fn](
+                    # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - base_params['sel_ec50'][sample_i]) - 1.0 ))
+                    base_params['sel_k'] * (pdat["selection_level"] - base_params['sel_ec50'][sample_i]))
+                prev_selected_mass = parent_pop_fraction * prev_selected_fraction
 
-            delta_log = vlogp - b_logp
-            if delta_log > 0:
-                b_logp = vlogp
-            elif delta_log < logp_min:
-                break
+                selected_mass = parent_pop_fraction * selected_fraction
 
-        for i in range(map_i - 1, -1, -1):
-            v = ec50_range[i]
-            work_params["sel_ec50"][ec50_i] = v
-            vlogp = self.logp(work_params)
-            if not numpy.isfinite(vlogp):
-                vlogp = -numpy.inf
-            results[i] = vlogp
+                selected_count = pdat["selected"].sum()
+                source_count = numpy.floor(float(selected_count) / pdat["fraction_selected"])
 
-            delta_log = vlogp - b_logp
-            if delta_log > 0:
-                b_logp = vlogp 
-            elif delta_log < logp_min:
-                break
+                modified_global_selection_fractions = (
+                    self.model_populations[pkey]['fraction_selected'](base_params)
+                    + selected_mass - prev_selected_mass
+                )
+            
+                sample_llhs += scipy.stats.binom.logpmf(
+                    selected_count,
+                    n=source_count,
+                    p=modified_global_selection_fractions
+                )
 
-        return results - b_logp
+            
+            llh_by_ec50_gen[:,pkey_n] = sample_llhs
+
+        llh_by_ec50 = llh_by_ec50_gen.sum(axis=1)
+                
+        return llh_by_ec50 - numpy.nanmax(llh_by_ec50)
     
     def estimate_ec50_cred(self, base_params, ec50_i, cred_spans = [.68, .95]):
         """Estimate EC50 credible interval for a single ec50 parameter via model probability."""
-        xs = numpy.arange(-3.1, 9, .1)
+        xs = numpy.arange(self.sel_range["lower"], self.sel_range["upper"], .1)
         logp = numpy.nan_to_num(self.ec50_logp_trace(base_params, ec50_i, xs))
         pmf = numpy.exp(logp) / numpy.sum(numpy.exp(logp))
         cdf = numpy.cumsum(pmf)
@@ -333,6 +353,7 @@ class FractionalSelectionModel(object):
             xs = xs,
             pmf = pmf,
             cdf = cdf,
+            logp = logp,
             sel_ec50 = base_params["sel_ec50"][ec50_i],
             cred_intervals = cred_intervals
         )
@@ -362,6 +383,75 @@ class FractionalSelectionModel(object):
             }
             for pkey in self.model_populations
         }
+
+
+    def plot_fit_summary(model, i, fit):
+        import scipy.stats
+        from matplotlib import pylab
+
+        sel_sum = model.model_selection_summary(fit)
+        
+        sel_levels = {
+            k : p["selection_level"] if p["selection_level"] else 0
+            for k, p in model.population_data.items()}
+        
+        sel_fracs = {
+            k : p["selected"][i] / p["selected"].sum()
+            for k, p in model.population_data.items()}
+        
+        pylab.xticks(
+            sel_levels.values(), sel_levels.keys())
+        pylab.xlim((-1, 7))
+        
+        porder = [
+            k for k, p in
+            sorted(model.population_data.items(), key=lambda (k, p): p["selection_level"])]
+        
+        pylab.plot(
+            [sel_levels[k] for k in porder],
+            [sel_fracs[k] for k in porder],
+            "-o",
+            color="black", label="observed")
+        
+        lbl = False
+        for k in sel_sum:
+            n = sel_sum[k]["selected"].sum()
+            p = sel_sum[k]["pop_fraction"][i]
+            sel_level = model.population_data[k]["selection_level"]
+            
+            if p<=0:
+                continue
+            
+            bn = scipy.stats.binom(n=n, p=p)
+            
+            parkey = model.population_data[k]["parent"]
+            pylab.plot(
+                [sel_levels[parkey], sel_levels[k]],
+                [sel_fracs[parkey], float(bn.ppf(.5)) / n],
+                "--", color="red", alpha=.25
+            )
+            
+            
+            
+            
+            for ci in (.68, .95, .99):
+                pylab.plot(
+                    [sel_level] * 2, bn.ppf([ci, 1-ci]) / n,
+                    linewidth=10, color="red", alpha=.25,
+                    label="predicted" if not lbl else None
+                )
+                lbl=True
+                
+        pylab.legend(fontsize="large", loc="best")
+        
+        pylab.twinx()
+        xs = numpy.linspace(-2, 8)
+        sel_ec50 = fit["sel_ec50"][i]
+        sel_k = fit["sel_k"][i] if len(fit["sel_k"]) > 1 else fit["sel_k"]
+        pylab.plot(xs, scipy.special.expit(-sel_k * (xs - sel_ec50)), alpha=.75)
+        pylab.yticks([], [])
+        
+        pylab.title("%s - ec50: %.2f - k: %.2f" % (i, sel_ec50, sel_k))
 
     def model_outlier_summary(self, params):
         selection_summary = self.model_selection_summary(params)
