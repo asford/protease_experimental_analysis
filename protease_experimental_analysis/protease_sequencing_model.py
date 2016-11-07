@@ -307,7 +307,7 @@ class FractionalSelectionModel(object):
 
             sample_llhs = scipy.stats.binom.logpmf(
                 pdat['selected'][sample_i],
-                n=pdat['num_selected'],
+                n=pdat['selected'].sum(),
                 p=sel_pop_fraction)
 
             if include_global_terms and pdat.get("fraction_selected") is not None:

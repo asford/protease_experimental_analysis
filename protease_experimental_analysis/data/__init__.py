@@ -23,11 +23,6 @@ def none_or_div(x1, x2):
         return None
     return x1 / x2
 
-def fix_num_selected(x):
-    if x == None:
-        return 5e5
-    return x
-
 summary=pd.read_csv(path.join(basedir, 'experiments.csv'))
 summary=summary.dropna(how='all')
 summary=summary.fillna('-')
@@ -46,7 +41,7 @@ for i, r in summary.iterrows():
     model_input[name][rnd] = dict(
         parent            = r['parent'],
         selection_level   = r['selection_strength'],
-        num_selected      = fix_num_selected(r['cells_collected']),
+        num_selected      = r['cells_collected'] if r['cells_collected'] else 5e5,
         fraction_selected = none_or_div(r['fraction_collected'], r['parent_expression']),
         conc_factor       = r['conc_factor']
     )
@@ -68,9 +63,11 @@ for exper in model_input:
     
     for k, v in model_input[exper].items():
         if v["seq_counts"].sum() > v["num_selected"]: 
+            # Seq counts assumed to accurately reflect selected population distribution
             pfrac = v["seq_counts"].values.astype(float) / v['seq_counts'].sum()
             v["selected"] = np.floor(pfrac * v["num_selected"])
         else:
             v["num_selected"] = v["seq_counts"].sum()
             v["selected"] = np.array(v["seq_counts"].astype(np.float))
+        del v["num_selected"]
         v['min_fraction'] = None
