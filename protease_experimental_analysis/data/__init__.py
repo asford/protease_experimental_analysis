@@ -9,7 +9,7 @@ from os import path
 
 import collections
 
-__all__ = ["model_input"]
+__all__ = ["model_input", "counts", "summary"]
 
 basedir = path.dirname(__file__) 
 
@@ -50,12 +50,18 @@ for i, r in summary.iterrows():
         fraction_selected = none_or_div(r['fraction_collected'], r['parent_expression']),
         conc_factor       = r['conc_factor']
     )
+    
+counts = {
+    exper : pd.read_csv(
+        path.join(basedir, exper + ".counts"),
+        delim_whitespace=True)
+    for exper in model_input
+}
+
 
 for exper in model_input:
-    counts_df = pd.read_csv(
-            path.join(basedir, exper + ".counts"),
-            delim_whitespace=True)
-
+    counts_df = counts[exper]
+    
     for i, col in enumerate(counts_df.columns[1:]):
         model_input[exper][i]["name"] = counts_df["name"]
         model_input[exper][i]['seq_counts'] = counts_df[col].astype(np.int)

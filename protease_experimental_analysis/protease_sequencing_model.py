@@ -202,7 +202,8 @@ class FractionalSelectionModel(object):
                 selected = pymc3.distributions.Multinomial(
                     name = "selected_%s" % pkey,
                     n=pdat["selected"][pop_mask].sum(),
-                    p=unorm(selection_dist)[pop_mask],
+                    # Add epsilon to selection prob to avoid nan-results when p==0
+                    p=unorm(selection_dist + 1e-6)[pop_mask],
                     observed=pdat["selected"][pop_mask]
                 )
                 
@@ -261,14 +262,17 @@ class FractionalSelectionModel(object):
 
             if cur_i < l_b or cur_i > u_b:
                 num_outlier += 1
-                params["sel_ec50"][i] = cred_summary["xs"][int((l_b + u_b) / 2)]
+                #Clip back into self.sel_range
+                params["sel_ec50"][i] = numpy.clip(
+                    cred_summary["xs"][int((l_b + u_b) / 2)],
+                    self.sel_range["lower"] + .1,
+                    self.sel_range["upper"] - .1)
+
 
         logger.info(
             "Modified %.3f outliers. (%i/%i)",
              num_outlier / self.num_members, num_outlier, self.num_members)
-
-        #Clip back into range of src_params to avoid issues with model parameter ranges.
-        params["sel_ec50"] = numpy.clip(params["sel_ec50"], src_params["sel_ec50"].min(), src_params["sel_ec50"].max())
+    
     
         return params
     
