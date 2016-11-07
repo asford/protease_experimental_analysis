@@ -23,23 +23,38 @@ import scipy.optimize
 def unorm(v):
     return v / v.sum()
 
-class FractionalSelectionModel(object):
-    response_impl = {
-        "scipy" : {
-            "expit" : lambda xs: 1 - scipy.special.expit(xs),
-            "erf" : lambda xs : 1 - ((scipy.special.erf(xs / 2) + 1) / 2)},
-        "theano" : {
-            "expit" : lambda xs: 1 - 1 / (1 + T.exp(-xs)),
-            "erf" : lambda xs : 1 - ((T.erf(xs / 2) + 1) / 2)},
-    }
 
-    def __init__(self, leak_prob_mass=True, response_fn="expit", homogenous_k=True):
-        self.response_fn = response_fn
+class SelectionResponseFn(object):
+    def selection_mass(self, **kwargs):
+        if any(isinstance(v, (T.TensorVariable, T.TensorConstant)) for v in kwargs.values()):
+            kwargs = { k : T.as_tensor_variable(v) for k, v in kwargs.items() }
+            return self.selection_mass_impl(num=T, **kwargs)
+        else:
+            return self.selection_mass_impl(num=numpy, **kwargs)
+
+class LogisticResponse(SelectionResponseFn):
+    def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50):
+        sel_xs = sel_k * (sel_level - sel_ec50)
+        return 1 - 1 / (1 + num.exp(-sel_xs))
+
+class FractionalSelectionModel(object):
+
+    @property
+    def response_impl(self):
+        if isinstance(self.response_fn, SelectionResponseFn):
+            return self.response_fn
+        elif isinstance(self.response_fn, basestring):
+            response_classes = { c.__name__ : c for c in SelectionResponseFn.__subclasses__() }
+
+            assert self.response_fn in response_classes, "Invalid response_fn name: %s" % self.response_fn
+            return response_classes[self.response_fn]()
+        else:
+            raise ValueError("Invalid response_fn", self.response_fn)
+
+    def __init__(self, leak_prob_mass=True, homogenous_k=True):
+        self.response_fn = "LogisticResponse"
         self.homogenous_k = homogenous_k
         self.leak_prob_mass = leak_prob_mass
-
-        for k in self.response_impl:
-            assert self.response_fn in self.response_impl[k]
 
     @staticmethod
     def lognorm_params(sd, mode):
@@ -83,8 +98,8 @@ class FractionalSelectionModel(object):
                 
             start_dist = unorm(start_pop)
             if p["selection_level"] is not None:
-                rf = self.response_impl["scipy"][self.response_fn]
-                src_dist = start_dist * rf(sel_k * (p["selection_level"] - sel_ec50))
+                src_dist = start_dist * self.response_impl.selection_mass(
+                    sel_level = p["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50)
                 fraction_selected = src_dist.sum() / start_dist.sum()
             else:
                 src_dist = start_dist
@@ -186,8 +201,9 @@ class FractionalSelectionModel(object):
 
                 start_dist = unorm(start_pop)
                 if pdat["selection_level"] is not None:
-                    rf = self.response_impl["theano"][self.response_fn]
-                    selection_mass = rf(sel_k * (T.constant(pdat["selection_level"]) - sel_ec50))
+                    selection_mass = self.response_impl.selection_mass(
+                        sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50)
+
                     if self.leak_prob_mass:
                         selection_mass = min_prob_mass + (selection_mass * (1 - min_prob_mass))
 
@@ -295,9 +311,9 @@ class FractionalSelectionModel(object):
                 continue
 
             # calculate selection results for full ec50 range
-            selected_fraction = self.response_impl["scipy"][self.response_fn](
-                # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - ec50_range) - 1.0 ))
-                base_params['sel_k'] * (pdat["selection_level"] - ec50_range))
+            # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - ec50_range) - 1.0 ))
+            selected_fraction = self.response_impl.selection_mass(
+                sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = ec50_range)
 
             
             sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]['fraction_selected'](base_params)
@@ -311,9 +327,8 @@ class FractionalSelectionModel(object):
                 p=sel_pop_fraction)
 
             if include_global_terms and pdat.get("fraction_selected") is not None:
-                prev_selected_fraction = self.response_impl["scipy"][self.response_fn](
-                    # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - base_params['sel_ec50'][sample_i]) - 1.0 ))
-                    base_params['sel_k'] * (pdat["selection_level"] - base_params['sel_ec50'][sample_i]))
+                prev_selected_fraction = self.response_impl.selection_mass(
+                    sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = base_params['sel_ec50'][sample_i])
                 prev_selected_mass = parent_pop_fraction * prev_selected_fraction
 
                 selected_mass = parent_pop_fraction * selected_fraction
@@ -526,12 +541,10 @@ class TestFractionalSelectionModel(unittest.TestCase):
 
 
     def test_basic_model(self):
-        for rf in ("expit", "erf"):
+        self.test_model = FractionalSelectionModel(homogenous_k=True)
+        self.test_data = self.test_model.generate_data(self.pop_specs, **self.test_vars)
 
-            self.test_model = FractionalSelectionModel(response_fn = rf, homogenous_k=True)
-            self.test_data = self.test_model.generate_data(self.pop_specs, **self.test_vars)
-
-            test_map = self.test_model.build_model( self.test_data ).find_MAP()
-            
-            numpy.testing.assert_allclose( test_map["sel_k"], self.test_vars["sel_k"], rtol=1e-2, atol=.025)
-            numpy.testing.assert_allclose( test_map["sel_ec50"], self.test_vars["sel_ec50"], rtol=.3)
+        test_map = self.test_model.build_model( self.test_data ).find_MAP()
+        
+        numpy.testing.assert_allclose( test_map["sel_k"], self.test_vars["sel_k"], rtol=1e-2, atol=.025)
+        numpy.testing.assert_allclose( test_map["sel_ec50"], self.test_vars["sel_ec50"], rtol=.3)
