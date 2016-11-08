@@ -25,6 +25,10 @@ def unorm(v):
 
 
 class SelectionResponseFn(object):
+    @property
+    def population_params(self):
+        return []
+
     def selection_mass(self, **kwargs):
         if any(isinstance(v, (T.TensorVariable, T.TensorConstant)) for v in kwargs.values()):
             kwargs = { k : T.as_tensor_variable(v) for k, v in kwargs.items() }
@@ -35,6 +39,15 @@ class SelectionResponseFn(object):
 class LogisticResponse(SelectionResponseFn):
     def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50):
         sel_xs = sel_k * (sel_level - sel_ec50)
+        return 1 - 1 / (1 + num.exp(-sel_xs))
+
+class NormalSpaceLogisticResponse(SelectionResponseFn):
+    @property
+    def population_params(self):
+        return ["conc_factor"]
+
+    def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50, conc_factor):
+        sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)
         return 1 - 1 / (1 + num.exp(-sel_xs))
 
 class FractionalSelectionModel(object):
@@ -51,8 +64,8 @@ class FractionalSelectionModel(object):
         else:
             raise ValueError("Invalid response_fn", self.response_fn)
 
-    def __init__(self, leak_prob_mass=True, homogenous_k=True):
-        self.response_fn = "LogisticResponse"
+    def __init__(self, response_fn = "LogisticResponse", leak_prob_mass=True, homogenous_k=True):
+        self.response_fn = response_fn
         self.homogenous_k = homogenous_k
         self.leak_prob_mass = leak_prob_mass
 
@@ -99,7 +112,9 @@ class FractionalSelectionModel(object):
             start_dist = unorm(start_pop)
             if p["selection_level"] is not None:
                 src_dist = start_dist * self.response_impl.selection_mass(
-                    sel_level = p["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50)
+                    sel_level = p["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50,
+                    **{param : p[param] for param in self.response_impl.population_params}
+                )
                 fraction_selected = src_dist.sum() / start_dist.sum()
             else:
                 src_dist = start_dist
@@ -133,7 +148,10 @@ class FractionalSelectionModel(object):
 
     def build_model(self, population_data):
         for k, p in population_data.items():
-            unused_keys = set(p.keys()).difference( {"selected", "fraction_selected", "selection_level", "parent"} )
+            unused_keys = set(p.keys()).difference(
+                ["selected", "fraction_selected", "selection_level", "parent"] +
+                list(self.response_impl.population_params)
+            )
             if unused_keys:
                 logger.warning("Unused keys in population_data[%r] : %s", k, unused_keys)
                 
@@ -202,7 +220,9 @@ class FractionalSelectionModel(object):
                 start_dist = unorm(start_pop)
                 if pdat["selection_level"] is not None:
                     selection_mass = self.response_impl.selection_mass(
-                        sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50)
+                        sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50,
+                        **{param : pdat[param] for param in self.response_impl.population_params}
+                    )
 
                     if self.leak_prob_mass:
                         selection_mass = min_prob_mass + (selection_mass * (1 - min_prob_mass))
@@ -313,7 +333,9 @@ class FractionalSelectionModel(object):
             # calculate selection results for full ec50 range
             # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - ec50_range) - 1.0 ))
             selected_fraction = self.response_impl.selection_mass(
-                sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = ec50_range)
+                sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = ec50_range,
+                **{param : pdat[param] for param in self.response_impl.population_params}
+            )
 
             
             sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]['fraction_selected'](base_params)
@@ -328,7 +350,10 @@ class FractionalSelectionModel(object):
 
             if include_global_terms and pdat.get("fraction_selected") is not None:
                 prev_selected_fraction = self.response_impl.selection_mass(
-                    sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = base_params['sel_ec50'][sample_i])
+                    sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = base_params['sel_ec50'][sample_i],
+                    **{param : pdat[param] for param in self.response_impl.population_params}
+                )
+
                 prev_selected_mass = parent_pop_fraction * prev_selected_fraction
 
                 selected_mass = parent_pop_fraction * selected_fraction
