@@ -6,6 +6,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 import copy
+
+import traitlets
+
 import numpy
 
 import theano.tensor as T
@@ -50,7 +53,23 @@ class NormalSpaceLogisticResponse(SelectionResponseFn):
         sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)
         return 1 - 1 / (1 + num.exp(-sel_xs))
 
-class FractionalSelectionModel(object):
+class FractionalSelectionModel(traitlets.HasTraits):
+    response_fn = traitlets.Union([
+        traitlets.Instance(SelectionResponseFn),
+        traitlets.ObjectName()
+    ])
+
+    @traitlets.validate("response_fn")
+    def _validate_response_fn(self, proposal):
+        fn = proposal["value"]
+
+        if isinstance(fn, basestring):
+            response_classes = { c.__name__ : c for c in SelectionResponseFn.__subclasses__() }
+
+            if not self.response_fn in response_classes:
+                raise traitlets.TraitError("Invalid response_fn name: %s" % fn)
+
+        return fn
 
     @property
     def response_impl(self):
@@ -64,10 +83,25 @@ class FractionalSelectionModel(object):
         else:
             raise ValueError("Invalid response_fn", self.response_fn)
 
-    def __init__(self, response_fn = "LogisticResponse", leak_prob_mass=True, homogenous_k=True):
-        self.response_fn = response_fn
-        self.homogenous_k = homogenous_k
-        self.leak_prob_mass = leak_prob_mass
+    min_selection_rate = traitlets.Union([
+        traitlets.Bool(),
+        traitlets.Float()
+    ])
+
+    homogenous_min_selection_mass = traitlets.Union([
+        traitlets.Bool(),
+        traitlets.Float()
+    ])
+
+    homogenous_k = traitlets.Bool(default_value=True)
+
+    def __init__(self, **kwargs):
+        # Override 'super' error-handling logic in HasTraits base __init__
+        # __init__ swallows errors from unused kwargs until v4.3
+        for key in kwargs:
+            if not self.has_trait(key):
+                raise TypeError("__init__() got an unexpected keyword argument '%s'" % key )
+        traitlets.HasTraits.__init__(self, **kwargs)
 
     @staticmethod
     def lognorm_params(sd, mode):
@@ -201,10 +235,15 @@ class FractionalSelectionModel(object):
                     **self.sel_range)
                 )
 
-            if self.leak_prob_mass:
-                min_prob_mass = self.add_fit_param(
-                    "min_prob_mass",
-                    pymc3.HalfNormal.dist(sd=.1, testval=.05))
+            if self.min_selection_rate:
+                if isinstance(self.min_selection_rate, bool):
+                    logger.info("Adding adaptive min_selection_rate.")
+                    min_selection_rate = self.add_fit_param(
+                        "min_selection_rate",
+                        pymc3.HalfNormal.dist(sd=.1, testval=.05))
+                else:
+                    logger.info("Adding const min_selection_rate: %.03f" % self.min_selection_rate)
+                    min_selection_rate = float(self.min_selection_rate)
         
             pops_by_depth = sorted(
                 population_data.keys(),
@@ -224,8 +263,8 @@ class FractionalSelectionModel(object):
                         **{param : pdat[param] for param in self.response_impl.population_params}
                     )
 
-                    if self.leak_prob_mass:
-                        selection_mass = min_prob_mass + (selection_mass * (1 - min_prob_mass))
+                    if self.min_selection_rate:
+                        selection_mass = min_selection_rate + (selection_mass * (1 - min_selection_rate))
 
                     selection_dist = start_dist * selection_mass
                     fraction_selected = selection_dist.sum() / start_dist.sum()
