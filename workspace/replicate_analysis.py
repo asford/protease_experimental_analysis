@@ -30,7 +30,18 @@ def build_and_fit_model(dataset, parameters):
 
     params = model.find_MAP()
 
-    return params
+    predictions = {
+        p : {
+            k : ps[k](params)
+            for k in ("fraction_selected", "selection_dist")
+        }
+        for p, ps in model.model_populations.items()
+    }
+
+    return {
+        "params" : params,
+        "predictions" : predictions
+    }
 
 replicate_pairs = {
     "%s_%s" % s : ("%s_%s" % s, "%s_redo_%s" % s)
@@ -39,7 +50,8 @@ replicate_pairs = {
 
 param_space = dict(
     response_fn = ("LogisticResponse", "NormalSpaceLogisticResponse"),
-    min_selection_rate = (True, False, .05),
+    min_selection_rate = (True, False),
+    min_selection_mass = (True, False),
 )
 
 datasets = chain(*replicate_pairs.values())

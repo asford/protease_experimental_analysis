@@ -88,7 +88,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
         traitlets.Float()
     ])
 
-    homogenous_min_selection_mass = traitlets.Union([
+    min_selection_mass = traitlets.Union([
         traitlets.Bool(),
         traitlets.Float()
     ])
@@ -244,6 +244,20 @@ class FractionalSelectionModel(traitlets.HasTraits):
                 else:
                     logger.info("Adding const min_selection_rate: %.03f" % self.min_selection_rate)
                     min_selection_rate = float(self.min_selection_rate)
+            else:
+                min_selection_rate = 0.0
+
+            if self.min_selection_mass:
+                if isinstance(self.min_selection_mass, bool):
+                    logger.info("Adding adaptive min_selection_mass.")
+                    min_selection_mass = self.add_fit_param(
+                        "min_selection_mass",
+                        pymc3.HalfNormal.dist(sd=1e-3, testval=1e-4))
+                else:
+                    logger.info("Adding const min_selection_mass: %.03f" % self.min_selection_mass)
+                    min_selection_mass = float(self.min_selection_mass)
+            else:
+                min_selection_mass = 0.0
         
             pops_by_depth = sorted(
                 population_data.keys(),
@@ -258,27 +272,30 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
                 start_dist = unorm(start_pop)
                 if pdat["selection_level"] is not None:
-                    selection_mass = self.response_impl.selection_mass(
+                    selection_mass_frac = self.response_impl.selection_mass(
                         sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50,
                         **{param : pdat[param] for param in self.response_impl.population_params}
                     )
 
-                    if self.min_selection_rate:
-                        selection_mass = min_selection_rate + (selection_mass * (1 - min_selection_rate))
+                    selection_mass_frac = min_selection_rate + (selection_mass_frac * (1 - min_selection_rate))
 
-                    selection_dist = start_dist * selection_mass
-                    fraction_selected = selection_dist.sum() / start_dist.sum()
+                    selection_mass = start_dist * selection_mass_frac
+
+                    fraction_selected = selection_mass.sum() / start_dist.sum()
                 else:
-                    selection_dist = start_dist
+                    selection_mass_dist = start_dist
                     fraction_selected = 1.0
-                
-                pop_mask = numpy.flatnonzero(start_pop > 0)  #multinomial formula returns nan if any p == 0, file bug?
+
+                #multinomial formula returns nan if any p == 0, file bug?
+                # Add epsilon to selection prob to avoid nan-results when p==0
+                selection_dist = unorm(
+                    T.clip(selection_mass, min_selection_mass + 1e-9, 1))
+                pop_mask = numpy.flatnonzero(start_pop > 0)
 
                 selected = pymc3.distributions.Multinomial(
                     name = "selected_%s" % pkey,
                     n=pdat["selected"][pop_mask].sum(),
-                    # Add epsilon to selection prob to avoid nan-results when p==0
-                    p=unorm(selection_dist + 1e-6)[pop_mask],
+                    p=selection_dist[pop_mask],
                     observed=pdat["selected"][pop_mask]
                 )
                 
@@ -359,6 +376,22 @@ class FractionalSelectionModel(traitlets.HasTraits):
     
     def ec50_logp_trace(self, base_params, sample_i, ec50_range, include_global_terms=True):
         llh_by_ec50_gen = numpy.zeros((len(ec50_range), len(self.model_populations)))
+
+        if self.min_selection_rate:
+            if self.min_selection_rate == True:
+                min_selection_rate = base_params["min_selection_rate"]
+            else:
+                min_selection_rate = self.min_selection_rate
+        else:
+            min_selection_rate = 0
+
+        if self.min_selection_mass:
+            if self.min_selection_mass == True:
+                min_selection_mass = base_params["min_selection_mass"]
+            else:
+                min_selection_mass = self.min_selection_mass
+        else:
+            min_selection_mass = 0
         
         for pkey_n, pkey in enumerate(self.model_populations):
             
@@ -376,16 +409,15 @@ class FractionalSelectionModel(traitlets.HasTraits):
                 **{param : pdat[param] for param in self.response_impl.population_params}
             )
 
-            
+            selected_fraction = min_selection_rate + (selected_fraction * (1 - min_selection_rate))
+
             sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]['fraction_selected'](base_params)
             
-            # if pdat['min_fraction'] != None:
-                # sel_pop_fraction = numpy.clip(sel_pop_fraction, min=ppdat['min_fraction'], max=None)
-
             sample_llhs = scipy.stats.binom.logpmf(
                 pdat['selected'][sample_i],
                 n=pdat['selected'].sum(),
-                p=sel_pop_fraction)
+                p=numpy.clip(sel_pop_fraction, min_selection_mass + 1e-9, 1.0)
+            )
 
             if include_global_terms and pdat.get("fraction_selected") is not None:
                 prev_selected_fraction = self.response_impl.selection_mass(
