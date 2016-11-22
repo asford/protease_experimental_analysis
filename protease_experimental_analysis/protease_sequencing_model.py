@@ -23,9 +23,37 @@ import scipy.stats.distributions
 import scipy.stats
 import scipy.optimize
 
+from pymc3.distributions import Continuous
+from pymc3.distributions.continuous import get_tau_sd
+from pymc3.distributions.continuous import bound
+
+from .utility import resolve_subclass, SubclassName
+
+class FlatNormal(Continuous):
+
+    def __init__(self, mu=0.0, w=0.0, tau=None, sd=None, *args, **kwargs):
+        super(FlatNormal, self).__init__(*args, **kwargs)
+        self.mean = self.median = self.mode = self.mu = mu
+        self.tau, self.sd = get_tau_sd(tau=tau, sd=sd)
+        self.variance = 1. / self.tau
+        self.w = w
+
+    def logp(self, value):
+        tau = self.tau
+        sd = self.sd
+        mu = self.mu
+        w = self.w
+        return bound(
+            (-tau * ( T.maximum(
+                T.minimum(value - mu+w, 0)**2.0,
+                T.maximum(value - mu-w, 0)**2.0
+            )) + T.log(tau / numpy.pi / 2.)) / 2.,
+            tau > 0,
+            sd > 0
+        )
+
 def unorm(v):
     return v / v.sum()
-
 
 class SelectionResponseFn(object):
     @property
@@ -54,34 +82,33 @@ class NormalSpaceLogisticResponse(SelectionResponseFn):
         return 1 - 1 / (1 + num.exp(-sel_xs))
 
 class FractionalSelectionModel(traitlets.HasTraits):
-    response_fn = traitlets.Union([
-        traitlets.Instance(SelectionResponseFn),
-        traitlets.ObjectName()
-    ])
-
-    @traitlets.validate("response_fn")
-    def _validate_response_fn(self, proposal):
-        fn = proposal["value"]
-
-        if isinstance(fn, basestring):
-            response_classes = { c.__name__ : c for c in SelectionResponseFn.__subclasses__() }
-
-            if not self.response_fn in response_classes:
-                raise traitlets.TraitError("Invalid response_fn name: %s" % fn)
-
-        return fn
+    response_fn = SubclassName(SelectionResponseFn)
 
     @property
     def response_impl(self):
-        if isinstance(self.response_fn, SelectionResponseFn):
-            return self.response_fn
-        elif isinstance(self.response_fn, basestring):
-            response_classes = { c.__name__ : c for c in SelectionResponseFn.__subclasses__() }
+       return resolve_subclass(SelectionResponseFn, self.response_fn)()
 
-            assert self.response_fn in response_classes, "Invalid response_fn name: %s" % self.response_fn
-            return response_classes[self.response_fn]()
-        else:
-            raise ValueError("Invalid response_fn", self.response_fn)
+    sel_k = traitlets.Dict(
+        traits = dict(
+            __class__ = SubclassName(Continuous)
+        ),
+        default_value = dict(
+            __class__="FlatNormal",
+            mu=4,
+            sd=0.0001,
+            w=2.5,
+        )
+    )
+
+    @property
+    def sel_k_class(self):
+        return resolve_subclass(Continuous, self.sel_k["__class__"])
+
+    @property
+    def sel_k_kwargs(self):
+        kwargs = dict(self.sel_k)
+        kwargs.pop("__class__")
+        return kwargs
 
     min_selection_rate = traitlets.Union([
         traitlets.Bool(),
@@ -217,11 +244,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
         with self.model:
             sel_k = self.add_fit_param(
                 "sel_k",
-                pymc3.Uniform.dist(
-                    shape=1 if self.homogenous_k else self.num_members,
-                    lower=0.1, upper=9.0,
-                    testval=1.5
-            ))
+                self.sel_k_class.dist(**self.sel_k_kwargs))
 
             sel_values = set(
                 float(p["selection_level"])
