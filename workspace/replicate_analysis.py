@@ -49,8 +49,8 @@ replicate_pairs = {
 }
 
 param_space = dict(
-    response_fn = ("NormalSpaceLogisticResponse",),
-    min_selection_mass = ["global", "per_selection", False] + [1 * 10 ** -a for a in range(2, 7)],
+    response_fn = ("NormalSpaceErfResponse",),
+    min_selection_mass = ["global", "per_selection", False] + [1 * 10 ** -a for a in range(5, 8)],
 )
 
 datasets = chain(*replicate_pairs.values())

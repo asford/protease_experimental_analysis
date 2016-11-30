@@ -71,6 +71,21 @@ class LogisticResponse(SelectionResponseFn):
     def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50):
         sel_xs = sel_k * (sel_level - sel_ec50)
         return 1 - 1 / (1 + num.exp(-sel_xs))
+    
+class NormalSpaceErfResponse(SelectionResponseFn):
+    @property
+    def population_params(self):
+        return ["conc_factor"]
+
+    def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50, conc_factor):
+        sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)
+        
+        if num == numpy:
+            erf = scipy.special.erf
+        else:
+            erf = T.erf
+            
+        return 1 - ((erf(sel_xs / 2) + 1) / 2)
 
 class NormalSpaceLogisticResponse(SelectionResponseFn):
     @property
