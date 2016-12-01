@@ -1,3 +1,5 @@
+*.jugdata
+
 
 # Created by https://www.gitignore.io/api/python,ipythonnotebook,osx
 
