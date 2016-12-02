@@ -137,6 +137,8 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
     homogenous_k = traitlets.Bool(default_value=True)
 
+    outlier_detection_opt_cycles = traitlets.Integer(default_value=1)
+
     def __init__(self, **kwargs):
         # Override 'super' error-handling logic in HasTraits base __init__
         # __init__ swallows errors from unused kwargs until v4.3
@@ -416,10 +418,13 @@ class FractionalSelectionModel(traitlets.HasTraits):
         return params
     
     def find_MAP(self, start = None):
-        init = self.optimize_params(start)
-        resampled = self.opt_ec50_cred_outliers(init)
-        final = self.optimize_params(resampled)
-        return final
+        params = self.optimize_params(start)
+
+        for _ in range(self.outlier_detection_opt_cycles):
+            resampled = self.opt_ec50_cred_outliers(params)
+            params = self.optimize_params(resampled)
+
+        return params 
     
     def ec50_logp_trace(self, base_params, sample_i, ec50_range, include_global_terms=True):
         llh_by_ec50_gen = numpy.zeros((len(ec50_range), len(self.model_populations)))
