@@ -33,7 +33,7 @@ def fit_model(dataset, parameters):
 @jug.TaskGenerator
 def report_model_ec50(dataset, model_parameters, fit_parameters):
     model = (
-        protease_sequencing_model.FractionalSelectionModel(**dict(parameters))
+        protease_sequencing_model.FractionalSelectionModel(**dict(model_parameters))
         .build_model(data.model_input[dataset])
     )
 
