@@ -1,0 +1,1 @@
+https://github.com/asford/jug@3290a88#egg=jug
