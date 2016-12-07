@@ -29,7 +29,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         return self.__getstate__()
     
     def __setstate__(self, state):
-        self.__init__(state["init_aas"], state["flanking_window"])
+        self.__init__(state["init_aas"], state["flanking_window"], state["weights_C"])
         
         if state.get("fit_coeffs_", None) is not None:
             self.setup()
@@ -40,10 +40,12 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
             "init_aas" : self.init_aas,
             "flanking_window" : self.flanking_window,
             "fit_coeffs_" : getattr(self, "fit_coeffs_", None),
+            "weights_C": self.weights_C,
         }
         
-    def __init__(self, init_aas = None, flanking_window = 4):
+    def __init__(self, init_aas = None, flanking_window = 4, weights_C=0.0):
         self.init_aas = init_aas
+        self.weights_C = weights_C
         self.flanking_window = flanking_window
         self.dat = {
             "seq" : T.lmatrix("seq"),
@@ -53,10 +55,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         self.vs = {
             "weights" : T.dmatrix("weights"),
             "seq_weights" : T.dvector("seq_weights"),
-            "ind_w" : T.scalar("ind_w"),
             "ind_b" : T.scalar("ind_b"),
-            "tot_w" : T.scalar("tot_w"),
-            "tot_b" : T.scalar("tot_b"),
             "tot_l" : T.scalar("tot_l"),
         }
         
@@ -70,10 +69,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         self.v_dtypes = {
             "weights" : (float, (2 * self.flanking_window + 1, 20)),
             "seq_weights" : (float, 20),
-            "ind_w" : (float, ()),
             "ind_b" : (float, ()),
-            "tot_w" : (float, ()),
-            "tot_b" : (float, ()),
             "tot_l" : (float, ()),
         }
         
@@ -110,39 +106,54 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
     
     def _build_model(self):
         weights = self.vs["weights"]
+        seq_weights = self.vs["seq_weights"]
+        
         window_size = self.flanking_window * 2 + 1
+        window_pos = range(self.flanking_window) + range(self.flanking_window+1, window_size)
+
         seq = self.dat["seq"]
             
-        point_score = [weights[window_size - 1, seq[:, window_size - 1:]]]
-        for i in range(0, window_size - 1):
-            point_score.append(weights[i, seq[:, i:-(window_size - 1 - i)]])
-        point_score.append(weights[window_size - 1, seq[:, window_size - 1:]])
-        pssm_score = sum(point_score)
+        point_scores = [
+            weights[
+                i,
+                seq[:, i:-(window_size - 1 - i) if i < window_size - 1 else None]
+            ]
+          for i in window_pos
+        ]
+
+        point_scores.append(
+            seq_weights[
+                seq[:, self.flanking_window:-(self.flanking_window)]
+            ]
+
+        )
+
+        pssm_score = sum(point_scores)
         
-        seq_weights = self.vs["seq_weights"]
-        center_i = self.flanking_window
-        
-        filter_score = seq_weights[seq[:,self.flanking_window:-self.flanking_window]]
-        
-        ind_w, ind_b = self.vs["ind_w"], self.vs["ind_b"]
-        ind_score = filter_score / (1 + T.exp(-ind_w * (pssm_score - ind_b)))
+        ind_b = self.vs["ind_b"]
+        ind_score = T.exp(pssm_score - ind_b)
         
         
-        tot_w, tot_b, tot_l = self.vs["tot_w"], self.vs["tot_b"], self.vs["tot_l"]
-        score = tot_l / (1 + T.exp(-tot_w * (ind_score.sum(axis=-1) - tot_b)))
+        tot_l = self.vs["tot_l"]
+        score = T.log(tot_l / (ind_score.sum(axis=-1) + 1)) / T.log(3)
         
         targ = self.dat["targ"]
+
         mse = T.mean(T.square(targ - score))
-        
         mse_jacobian = dict(zip(self.vs, T.jacobian(mse, self.vs.values())))
         
+        reg_mse = T.mean(T.square(targ - score)) + T.sum(self.weights_C * T.square(self.vs["weights"])) + T.sum(self.weights_C * T.abs_(self.vs["seq_weights"]))
+        reg_mse_jacobian = dict(zip(self.vs, T.jacobian(reg_mse, self.vs.values())))
+        
+
         self.targets = {
             "score" : score,
             "pssm_score" : pssm_score,
-            "filter_score" : filter_score,
             "ind_score" : ind_score,
             "mse" : mse,
-            "mse_jacobian" : mse_jacobian 
+            "mse_jacobian" : mse_jacobian,
+            "reg_mse" : reg_mse,
+            "reg_mse_jacobian" : reg_mse_jacobian
         }
     
     def opt_cycle(self, target_vars, **opt_options):
@@ -168,6 +179,26 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
             for n in jpack.dtype.names:
                 jpack[n] = jacobian[n]
             return jpack.reshape(1).view(float)
+
+        def eval_reg_mse(packed_vars):
+            vpack = packed_vars.copy().view(packed_dtype).reshape(())
+            vs = self.fit_coeffs_.copy()
+            for n in vpack.dtype.names:
+                vs[n] = vpack[n]
+                
+            return self.eval_f("reg_mse", coeffs=vs)
+        
+        def eval_reg_mse_jac(packed_vars):
+            vpack = packed_vars.copy().view(packed_dtype).reshape(())
+            vs = self.fit_coeffs_.copy()
+            for n in vpack.dtype.names:
+                vs[n] = vpack[n]
+                
+            jacobian = self.eval_f("reg_mse_jacobian", coeffs=vs)
+            jpack = numpy.zeros((), dtype=packed_dtype)
+            for n in jpack.dtype.names:
+                jpack[n] = jacobian[n]
+            return jpack.reshape(1).view(float)
         
         def iter_callback(packed_vars):
             if ic[0] % 10 == 0:
@@ -180,8 +211,8 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
             start_coeffs[n] = self.fit_coeffs_[n]
             
         opt_result = scipy.optimize.minimize(
-            fun=eval_mse,
-            jac=eval_mse_jac,
+            fun=eval_reg_mse,
+            jac=eval_reg_mse_jac,
             x0=start_coeffs.reshape(1).view(float),
             callback=iter_callback,
             **opt_options
@@ -190,11 +221,15 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         opt_result.packed_x = opt_result.x.copy().view(packed_dtype).reshape(())
         for n in opt_result.packed_x.dtype.names:
             self.fit_coeffs_[n] = opt_result.packed_x[n]
+        avg_p1 = numpy.average(self.fit_coeffs_["seq_weights"])
+        self.fit_coeffs_["seq_weights"] -= avg_p1
+        self.fit_coeffs_["ind_b"] -= avg_p1
+
         logging.info("last_opt iter: %03i mse: %.3f", ic[0], opt_result.fun)
         
         return opt_result
     
-    def fit(self, X, y):
+    def fit(self, X, y, tot_l=600):
         self.setup()
         
         self.fit_X_ = self.encode_seqs(X)
@@ -208,23 +243,31 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         else:
             self.fit_coeffs_["seq_weights"] = [1 if aa in self.init_aas else 0 for aa in IUPAC.IUPACProtein.letters]
 
-        self.fit_coeffs_["ind_w"] = -1
-        self.fit_coeffs_["ind_b"] = 0
-
-        self.fit_coeffs_["tot_l"] = 3.5
-        self.fit_coeffs_["tot_w"] = -1
-        self.fit_coeffs_["tot_b"] = 0
+        self.fit_coeffs_["ind_b"] =   0 #-2
+        self.fit_coeffs_["tot_l"] = tot_l #420 #4.5
         
         opt_cycles = [
-            ("seq_weights",), ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights",), ("seq_weights",), 
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights", "seq_weights"),
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights", "seq_weights"),
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l",   "weights", "seq_weights"),
+            ("seq_weights","ind_b","tot_l"),
+            ("weights",),
+            ("ind_b", "tot_l"),
+            ("seq_weights",), 
+            ("ind_b", "tot_l"),
+            ("weights", "seq_weights"),
+            #("ind_b", "tot_l"),
+            #("weights", "seq_weights"),
+            #("seq_weights","ind_b"), 
+            ("ind_b", "tot_l",   "weights", "seq_weights"),
+            #("ind_b", "tot_l"),
+            #("weights", "seq_weights"),
+            ("ind_b", "tot_l",   "weights", "seq_weights"),
+
         ]
         
         for i, vset in enumerate(opt_cycles):
             logging.info("opt_cycle: %i vars: %s", i, vset)
-            self._last_opt_result = self.opt_cycle(vset, tol=5e-3)
+            tol = 1e-3
+            if i == len(opt_cycles)-1: tol = 2e-5
+            self._last_opt_result = self.opt_cycle(vset, tol=tol) #5e-3
             
     def predict(self, X):
         return self.predict_fn(
