@@ -4,6 +4,8 @@ from __future__ import division
 
 import logging
 import random
+import copy
+import traitlets
 
 import numpy
 import Bio
@@ -17,8 +19,21 @@ import theano.tensor as T
 
 from sklearn.base import BaseEstimator, RegressorMixin
 
-class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
+class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits):
     
+    alpha_center = traitlets.Float(default_value=0, allow_none=False, min=0)
+    alpha_flank = traitlets.Float(default_value=0, allow_none=False, min=0)
+
+    flanking_window = traitlets.Integer(default_value=4, allow_none=False, min=0)
+
+    init_aas = traitlets.Set(
+        trait=traitlets.Enum( IUPAC.IUPACProtein.letters ),
+        default_value = None, allow_none = True,
+    )
+
+    def _get_param_names(self):
+        return self.trait_names()
+
     @classmethod
     def from_state(cls, params):
         instance = cls.__new__(cls)
@@ -29,31 +44,26 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         return self.__getstate__()
     
     def __setstate__(self, state):
-        self.__init__(state["init_aas"], state["flanking_window"], state["weights_C"])
-        
+        HasTraits.__setstate__(self, copy.deepcopy(state))
+
         if state.get("fit_coeffs_", None) is not None:
             self.setup()
             self.fit_coeffs_ = state["fit_coeffs_"]
         
     def __getstate__(self):
-        return {
-            "init_aas" : self.init_aas,
-            "flanking_window" : self.flanking_window,
-            "fit_coeffs_" : getattr(self, "fit_coeffs_", None),
-            "weights_C": self.weights_C,
-        }
-        
-    def __init__(self, init_aas = None, flanking_window = 4, weights_C=0.0):
-        self.init_aas = init_aas
-        self.weights_C = weights_C
-        self.flanking_window = flanking_window
+        state = HasTrait.__getstate__(self)
+        statekeys = (
+            "_trait_values", "_fit_coeffs",
+            "_trait_validators", "_trait_notifiers", "_cross_validation_lock",
+        )
+
+        for k in set(state) - set(statekeys):
+            del state[k]
+
+        return state
         
     def setup(self):
         """Validate parameters and setup estimator."""
-        
-        if self.init_aas is not None:
-            assert all(aa in IUPAC.IUPACProtein.letters for aa in self.init_aas), "Invalid pssm center aas: %s" % self.init_aas
-        assert self.flanking_window > 0, "Invalid flanking window size: %s" % self.flanking_window
 
         self.dat = {
             "seq" : T.lmatrix("seq"),
@@ -148,7 +158,8 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         targ = self.dat["targ"]
 
         mse = T.mean(T.square(targ - score))
-        regularization = (self.weights_C * T.square(weights)).sum() + (self.weights_C * T.abs_(seq_weights)).sum()
+        #todo asford l1/l2 loss per type, coeff per type?
+        regularization = (self.alpha_center * T.square(weights)).sum() + (self.alpha_flank * T.abs_(seq_weights)).sum()
 
         loss = mse + regularization
         loss_jacobian = dict(zip(self.vs, T.jacobian(loss, self.vs.values())))
@@ -236,10 +247,10 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         self.fit_coeffs_ = numpy.zeros((), self.coeff_dtype)
         
         self.fit_coeffs_["weights"][self.flanking_window] = 1
-        if self.init_aas is None:
-            self.fit_coeffs_["seq_weights"] = 0
-        else:
+        if self.init_aas:
             self.fit_coeffs_["seq_weights"] = [1 if aa in self.init_aas else 0 for aa in IUPAC.IUPACProtein.letters]
+        else:
+            self.fit_coeffs_["seq_weights"] = 0
 
         self.fit_coeffs_["ind_b"] = 0 
         # Initialize tot_l to mean of observed values

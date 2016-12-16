@@ -36,7 +36,8 @@ def model_cv_predictions(protease, parameters):
     return tdata
 
 param_space = {
-    "weights_C" : numpy.exp(numpy.arange(-9, 0, .5))
+    "alpha_center" : numpy.exp(numpy.arange(-7, -1)),
+    "alpha_flank" : numpy.exp(numpy.arange(-7, -1))
 }
 
 proteases = ["chymo", "tryp"]
