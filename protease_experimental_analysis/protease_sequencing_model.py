@@ -29,6 +29,11 @@ from pymc3.distributions.continuous import bound
 
 from .utility import resolve_subclass, SubclassName
 
+default_selk_dict={'mid': dict(mu=1.63, sd=0.00002, w=1.02),
+           'low': dict(mu=1.53, sd=0.00002, w=1.15),
+           'high': dict(mu=1.75, sd=0.00002, w=0.9),
+           'lowest': dict(mu=1.48, sd=0.00002, w=1.20)}
+
 class FlatNormal(Continuous):
 
     def __init__(self, mu=0.0, w=0.0, tau=None, sd=None, *args, **kwargs):
@@ -85,7 +90,7 @@ class NormalSpaceErfResponse(SelectionResponseFn):
         else:
             erf = T.erf
             
-        return 1 - ((erf(sel_xs / 2) + 1) / 2)
+        return (1.0 - erf(sel_xs)) / 2.0
 
 class NormalSpaceLogisticResponse(SelectionResponseFn):
     @property
@@ -94,7 +99,7 @@ class NormalSpaceLogisticResponse(SelectionResponseFn):
 
     def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50, conc_factor):
         sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)
-        return 1 - 1 / (1 + num.exp(-sel_xs))
+        return 1 - 1 / (1 + num.exp(-sel_xs * 2.45))
 
 class FractionalSelectionModel(traitlets.HasTraits):
     response_fn = SubclassName(SelectionResponseFn)
@@ -103,27 +108,31 @@ class FractionalSelectionModel(traitlets.HasTraits):
     def response_impl(self):
        return resolve_subclass(SelectionResponseFn, self.response_fn)()
 
-    sel_k = traitlets.Dict(
-        traits = dict(
-            __class__ = SubclassName(Continuous)
-        ),
-        default_value = dict(
-            __class__="FlatNormal",
-            mu=4,
-            sd=0.0001,
-            w=2.5,
-        )
-    )
+    #sel_k = traitlets.Dict(
+    #    traits = dict(
+    #        __class__ = SubclassName(Continuous)
+    #    ),
+    #    default_value = dict(
+    #        __class__="FlatNormal",
+    #        mu=1.63, #4.0, #1.63,
+    #        sd=0.00002, #0.0001, #0.00002,
+    #        w=1.02 #2.5 #1.02,
+    #    )
+    #)
+    #
+    #@property
+    #def sel_k_class(self):
+    #    return resolve_subclass(Continuous, self.sel_k["__class__"])
+    #
+    #@property
+    #def sel_k_kwargs(self):
+    #    kwargs = dict(self.sel_k)
+    #    kwargs.pop("__class__")
+    #    return kwargs
 
-    @property
-    def sel_k_class(self):
-        return resolve_subclass(Continuous, self.sel_k["__class__"])
+    sel_k_dict = traitlets.Enum(['mid','low','high','lowest'], default_value='mid')
 
-    @property
-    def sel_k_kwargs(self):
-        kwargs = dict(self.sel_k)
-        kwargs.pop("__class__")
-        return kwargs
+    sel_k = traitlets.Float()#min_selection_rate
 
     min_selection_rate = traitlets.Union([
         traitlets.Bool(),
@@ -136,6 +145,8 @@ class FractionalSelectionModel(traitlets.HasTraits):
     ])
 
     homogenous_k = traitlets.Bool(default_value=True)
+
+    alex_opt = traitlets.Bool(default_value=False)
 
     outlier_detection_opt_cycles = traitlets.Integer(default_value=1)
 
@@ -259,9 +270,15 @@ class FractionalSelectionModel(traitlets.HasTraits):
         self.modeled_populations = [ p for p in pops_by_depth if population_data[p]["parent"] is not None ]
 
         with self.model:
-            sel_k = self.add_fit_param(
-                "sel_k",
-                self.sel_k_class.dist(**self.sel_k_kwargs))
+            #sel_k = self.add_fit_param(
+            #    "sel_k",
+            #    self.sel_k_class.dist(**self.sel_k_kwargs))
+
+            #sel_k = self.add_fit_param(
+            #            "sel_k",
+            #            FlatNormal.dist(**default_selk_dict[self.sel_k_dict]))
+
+            sel_k=self.sel_k
 
             sel_values = set(
                 float(p["selection_level"])
@@ -285,7 +302,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
                     logger.info("Adding adaptive min_selection_rate.")
                     min_selection_rate = self.add_fit_param(
                         "min_selection_rate",
-                        pymc3.HalfNormal.dist(sd=.1, testval=.05))
+                        pymc3.HalfNormal.dist(sd=.0002, testval=.0001))
                 else:
                     logger.info("Adding const min_selection_rate: %.03f" % self.min_selection_rate)
                     min_selection_rate = float(self.min_selection_rate)
@@ -338,7 +355,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
                 #multinomial formula returns nan if any p == 0, file bug?
                 # Add epsilon to selection prob to avoid nan-results when p==0
                 selection_dist = unorm(
-                    T.clip(selection_mass, p_min_selection_mass + 1e-9, 1))
+                    T.clip(selection_mass, (p_min_selection_mass + 1e-9) * fraction_selected, 1))
                 pop_mask = numpy.flatnonzero(start_pop > 0)
 
                 selected = pymc3.distributions.Multinomial(
@@ -383,7 +400,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
         
         return { k : v(MAP) for k, v in self.fit_params.items() }
     
-    def opt_ec50_cred_outliers(self, src_params):
+    def opt_ec50_cred_outliers_alex(self, src_params):
         logger.info("scan_ec50_outliers: %i members", self.num_members)
         params = copy.deepcopy(src_params)
 
@@ -409,19 +426,40 @@ class FractionalSelectionModel(traitlets.HasTraits):
                     self.sel_range["lower"] + .1,
                     self.sel_range["upper"] - .1)
 
+    def opt_ec50_cred_outliers(self, src_params):
+        logger.info("scan_ec50_outliers: %i members", self.num_members)
+        params = copy.deepcopy(src_params)
+
+        num_outlier = 0
+        
+        for i in range(self.num_members):
+            if i % 1000 == 0:
+                logger.info("scan_ec50_outliers: %i / %i  outlier count: %s", i, self.num_members, num_outlier)
+                
+            cred_summary = self.estimate_ec50_cred(params, i)
+            current = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "left")
+            #rb = numpy.searchsorted(cred_summary["xs"], cred_summary["sel_ec50"], "right")
+
+            m_pmf = cred_summary["pmf"].argmax()
+
+            if m_pmf < current - 1 or m_pmf > current:
+                num_outlier += 1
+                params["sel_ec50"][i] = cred_summary["xs"][m_pmf]
 
         logger.info(
             "Modified %.3f outliers. (%i/%i)",
              num_outlier / self.num_members, num_outlier, self.num_members)
-    
-    
+
         return params
     
     def find_MAP(self, start = None):
         params = self.optimize_params(start)
 
         for _ in range(self.outlier_detection_opt_cycles):
-            resampled = self.opt_ec50_cred_outliers(params)
+            if self.alex_opt:
+                resampled = self.opt_ec50_cred_outliers_alex(params)
+            else:
+                resampled = self.opt_ec50_cred_outliers(params)
             params = self.optimize_params(resampled)
 
         return params 
@@ -461,8 +499,13 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
             # calculate selection results for full ec50 range
             # base_params['sel_k'] * (pdat['conc_factor'] ** (pdat['selection_level'] - ec50_range) - 1.0 ))
+            if "sel_k" in base_params:
+                sel_k = base_params["sel_k"]
+            else:
+                sel_k = self.sel_k
+
             selected_fraction = self.response_impl.selection_mass(
-                sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = ec50_range,
+                sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = ec50_range,
                 **{param : pdat[param] for param in self.response_impl.population_params}
             )
 
@@ -478,7 +521,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
             if include_global_terms and pdat.get("fraction_selected") is not None:
                 prev_selected_fraction = self.response_impl.selection_mass(
-                    sel_level = pdat["selection_level"], sel_k = base_params["sel_k"], sel_ec50 = base_params['sel_ec50'][sample_i],
+                    sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = base_params['sel_ec50'][sample_i],
                     **{param : pdat[param] for param in self.response_impl.population_params}
                 )
 
@@ -509,7 +552,9 @@ class FractionalSelectionModel(traitlets.HasTraits):
     
     def estimate_ec50_cred(self, base_params, ec50_i, cred_spans = [.68, .95]):
         """Estimate EC50 credible interval for a single ec50 parameter via model probability."""
-        xs = numpy.arange(self.sel_range["lower"], self.sel_range["upper"], .1)
+        #xs = numpy.arange(self.sel_range["lower"]+0.1, self.sel_range["upper"]-0.1, .1)
+        xs=numpy.linspace(self.sel_range['lower']+1,self.sel_range['upper']-1, (self.sel_range['upper'] - self.sel_range['lower'] - 2)*10 + 1)
+        
         logp = numpy.nan_to_num(self.ec50_logp_trace(base_params, ec50_i, xs))
         pmf = numpy.exp(logp) / numpy.sum(numpy.exp(logp))
         cdf = numpy.cumsum(pmf)
@@ -590,6 +635,8 @@ class FractionalSelectionModel(traitlets.HasTraits):
             n = sel_sum[k]["selected"].sum()
             p = sel_sum[k]["pop_fraction"][i]
             sel_level = model.population_data[k]["selection_level"]
+            counts=sel_sum[k]["selected"][i]
+            plt.text(sel_levels[k] + 0.2, sel_fracs[k], '%.0f' % counts)
             
             if p<=0:
                 continue

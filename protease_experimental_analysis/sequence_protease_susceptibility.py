@@ -4,6 +4,8 @@ from __future__ import division
 
 import logging
 import random
+import copy
+import traitlets
 
 import numpy
 import Bio
@@ -14,11 +16,34 @@ import scipy.special
 
 import theano
 import theano.tensor as T
+theano.config.mode = "FAST_RUN"
 
 from sklearn.base import BaseEstimator, RegressorMixin
 
-class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
+class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits):
     
+    alpha_center = traitlets.Float(default_value=0, allow_none=False, min=0)
+    alpha_flank = traitlets.Float(default_value=0, allow_none=False, min=0)
+
+    error_upper_lim = traitlets.Float(default_value=10, allow_none=False)
+    error_lower_lim = traitlets.Float(default_value=-10, allow_none=False)
+
+    max_data_upweight = traitlets.Float(default_value=1.0, allow_none=False, min=1.0)
+
+    init_tot_l = traitlets.Float(default_value=150.0, allow_none=False)
+    init_max_sumweight = traitlets.Float(default_value=80.0, allow_none=False)
+    init_ind_b = traitlets.Float(default_value=4.0, allow_none=False)
+
+    flanking_window = traitlets.Integer(default_value=4, allow_none=False, min=0)
+
+    init_aas = traitlets.Set(
+        trait=traitlets.Enum( IUPAC.IUPACProtein.letters ),
+        default_value = None, allow_none = True,
+    )
+
+    def _get_param_names(self):
+        return self.trait_names()
+
     @classmethod
     def from_state(cls, params):
         instance = cls.__new__(cls)
@@ -29,53 +54,55 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         return self.__getstate__()
     
     def __setstate__(self, state):
-        self.__init__(state["init_aas"], state["flanking_window"])
-        
+        HasTraits.__setstate__(self, copy.deepcopy(state))
+
         if state.get("fit_coeffs_", None) is not None:
             self.setup()
             self.fit_coeffs_ = state["fit_coeffs_"]
         
     def __getstate__(self):
-        return {
-            "init_aas" : self.init_aas,
-            "flanking_window" : self.flanking_window,
-            "fit_coeffs_" : getattr(self, "fit_coeffs_", None),
-        }
+        state = HasTrait.__getstate__(self)
+        statekeys = (
+            "_trait_values", "_fit_coeffs",
+            "_trait_validators", "_trait_notifiers", "_cross_validation_lock",
+        )
+
+        for k in set(state) - set(statekeys):
+            del state[k]
+
+        return state
         
-    def __init__(self, init_aas = None, flanking_window = 4):
-        self.init_aas = init_aas
-        self.flanking_window = flanking_window
+    def setup(self):
+        """Validate parameters and setup estimator."""
+
         self.dat = {
             "seq" : T.lmatrix("seq"),
             "targ" : T.dvector("targ"),
+            "data_weights" : T.dvector("data_weights"),
         }
+
+        self.dat["seq"].tag.test_value = numpy.random.randint(21, size=(5, 30))
+        self.dat["targ"].tag.test_value = numpy.random.random(5)
+        self.dat["data_weights"].tag.test_value = numpy.random.random(5)
         
         self.vs = {
             "weights" : T.dmatrix("weights"),
             "seq_weights" : T.dvector("seq_weights"),
-            "ind_w" : T.scalar("ind_w"),
             "ind_b" : T.scalar("ind_b"),
-            "tot_w" : T.scalar("tot_w"),
-            "tot_b" : T.scalar("tot_b"),
             "tot_l" : T.scalar("tot_l"),
+            "max_sumweight" : T.scalar("max_sumweight"),
         }
-        
-    def setup(self):
-        """Validate parameters and setup estimator."""
-        
-        if self.init_aas is not None:
-            assert all(aa in IUPAC.IUPACProtein.letters for aa in self.init_aas), "Invalid pssm center aas: %s" % self.init_aas
-        assert self.flanking_window > 0, "Invalid flanking window size: %s" % self.flanking_window
         
         self.v_dtypes = {
-            "weights" : (float, (2 * self.flanking_window + 1, 20)),
-            "seq_weights" : (float, 20),
-            "ind_w" : (float, ()),
+            "weights" : (float, (2 * self.flanking_window + 1, 21)),
+            "seq_weights" : (float, 21),
             "ind_b" : (float, ()),
-            "tot_w" : (float, ()),
-            "tot_b" : (float, ()),
             "tot_l" : (float, ()),
+            "max_sumweight" : (float, ()),
         }
+
+        for v in self.vs:
+            self.vs[v].tag.test_value = numpy.random.random( self.v_dtypes[v][1] )
         
         self.coeff_dtype = numpy.dtype([(n,) + t for n, t in self.v_dtypes.items()])
         
@@ -96,59 +123,94 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         
         if seqs.dtype == numpy.dtype("S1"):
             for aa in numpy.unique(seqs):
-                assert aa in IUPAC.IUPACProtein.letters, "Non-IUPAC letter code in input sequences: %r" % aa
+                assert aa in IUPAC.IUPACProtein.letters + 'Z', "Non-IUPAC/non-Z letter code in input sequences: %r" % aa
                     
             seqs = numpy.searchsorted(
-                numpy.fromstring(IUPAC.IUPACProtein.letters, dtype="S1"),
+                numpy.fromstring(IUPAC.IUPACProtein.letters + 'Z', dtype="S1"),
                 seqs
             )
-        
+
         assert seqs.dtype == numpy.int, "Invalid sequence dtype: %r" % seqs.dtype
-        assert seqs.min() >= 0 and seqs.max() < 20, "Invalid encoded sequence range: (%s, %s)" % (seqs.min(), seqs.max())
+        assert seqs.min() >= 0 and seqs.max() < 21, "Invalid encoded sequence range: (%s, %s)" % (seqs.min(), seqs.max())
         
         return seqs
     
     def _build_model(self):
+        
         weights = self.vs["weights"]
+        seq_weights = self.vs["seq_weights"]
+
+
         window_size = self.flanking_window * 2 + 1
+        window_pos = range(self.flanking_window) + range(self.flanking_window+1, window_size)
+
         seq = self.dat["seq"]
             
-        point_score = [weights[window_size - 1, seq[:, window_size - 1:]]]
-        for i in range(0, window_size - 1):
-            point_score.append(weights[i, seq[:, i:-(window_size - 1 - i)]])
-        point_score.append(weights[window_size - 1, seq[:, window_size - 1:]])
-        pssm_score = sum(point_score)
+        point_scores = [
+            weights[
+                i,
+                seq[:, i:-(window_size - 1 - i) if i < window_size - 1 else None]
+            ]
+          for i in window_pos
+        ]
+
+        point_scores.append(
+            seq_weights[
+                seq[:, self.flanking_window:-(self.flanking_window)]
+            ]
+
+        )
+
+        max_sumweight = self.vs["max_sumweight"]
+
+
+        #pssm_score = T.clip(sum(point_scores), -9999, max_sumweight)
+        pssm_score=sum(point_scores)
+
+        ind_b = self.vs["ind_b"]
+
         
-        seq_weights = self.vs["seq_weights"]
-        center_i = self.flanking_window
+        ind_score = max_sumweight / (1.0 + T.exp(ind_b - pssm_score))
         
-        filter_score = seq_weights[seq[:,self.flanking_window:-self.flanking_window]]
+        tot_l = self.vs["tot_l"]
+        #todo asford Lift exponent into data?
         
-        ind_w, ind_b = self.vs["ind_w"], self.vs["ind_b"]
-        ind_score = filter_score / (1 + T.exp(-ind_w * (pssm_score - ind_b)))
-        
-        
-        tot_w, tot_b, tot_l = self.vs["tot_w"], self.vs["tot_b"], self.vs["tot_l"]
-        score = tot_l / (1 + T.exp(-tot_w * (ind_score.sum(axis=-1) - tot_b)))
+
+        score = T.log(tot_l / (ind_score.sum(axis=-1) + 1)) / T.log(3)
         
         targ = self.dat["targ"]
-        mse = T.mean(T.square(targ - score))
-        
-        mse_jacobian = dict(zip(self.vs, T.jacobian(mse, self.vs.values())))
+        data_weights = self.dat["data_weights"]
+
+        error_upper_lim = self.error_upper_lim
+        error_lower_lim = self.error_lower_lim
+
+        error=T.clip(targ - score, error_lower_lim, error_upper_lim)
+
+        mse = T.mean(T.square(error) + (0.25 * T.abs_(targ - score)))
+        weighted_mse = T.sum((T.square(error) + (0.25 * T.abs_(targ - score)))* data_weights)  / T.sum(data_weights)
+        #todo asford l1/l2 loss per type, coeff per type?
+        regularization = (self.alpha_flank * T.square(weights[:,0:-1])).sum() + (self.alpha_center * T.abs_(seq_weights[0:-1])).sum()
+
+        loss = weighted_mse + regularization
+        loss_jacobian = dict(zip(self.vs, T.jacobian(loss, self.vs.values())))
         
         self.targets = {
             "score" : score,
             "pssm_score" : pssm_score,
-            "filter_score" : filter_score,
             "ind_score" : ind_score,
+
             "mse" : mse,
-            "mse_jacobian" : mse_jacobian 
+            "weighted_mse" : weighted_mse,
+            "regularization" : regularization,
+
+            "loss" : loss,
+            "loss_jacobian" : loss_jacobian,
         }
     
     def opt_cycle(self, target_vars, **opt_options):
         packed_dtype = numpy.dtype(
             [(n,) + self.v_dtypes[n] for n in target_vars])
-        
+
         def eval_mse(packed_vars):
             vpack = packed_vars.copy().view(packed_dtype).reshape(())
             vs = self.fit_coeffs_.copy()
@@ -157,13 +219,21 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
                 
             return self.eval_f("mse", coeffs=vs)
         
-        def eval_mse_jac(packed_vars):
+        def eval_loss(packed_vars):
             vpack = packed_vars.copy().view(packed_dtype).reshape(())
             vs = self.fit_coeffs_.copy()
             for n in vpack.dtype.names:
                 vs[n] = vpack[n]
                 
-            jacobian = self.eval_f("mse_jacobian", coeffs=vs)
+            return self.eval_f("loss", coeffs=vs)
+        
+        def eval_loss_jac(packed_vars):
+            vpack = packed_vars.copy().view(packed_dtype).reshape(())
+            vs = self.fit_coeffs_.copy()
+            for n in vpack.dtype.names:
+                vs[n] = vpack[n]
+                
+            jacobian = self.eval_f("loss_jacobian", coeffs=vs)
             jpack = numpy.zeros((), dtype=packed_dtype)
             for n in jpack.dtype.names:
                 jpack[n] = jacobian[n]
@@ -171,7 +241,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         
         def iter_callback(packed_vars):
             if ic[0] % 10 == 0:
-                logging.debug("iter: %03i mse: %.3f", ic[0], eval_mse(packed_vars))
+                logging.debug("iter: %03i mse: %.3f loss: %.3f", ic[0], eval_mse(packed_vars), eval_loss(packed_vars))
             ic[0] += 1
             
         ic = [0]
@@ -180,8 +250,8 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
             start_coeffs[n] = self.fit_coeffs_[n]
             
         opt_result = scipy.optimize.minimize(
-            fun=eval_mse,
-            jac=eval_mse_jac,
+            fun=eval_loss,
+            jac=eval_loss_jac,
             x0=start_coeffs.reshape(1).view(float),
             callback=iter_callback,
             **opt_options
@@ -190,41 +260,81 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         opt_result.packed_x = opt_result.x.copy().view(packed_dtype).reshape(())
         for n in opt_result.packed_x.dtype.names:
             self.fit_coeffs_[n] = opt_result.packed_x[n]
-        logging.info("last_opt iter: %03i mse: %.3f", ic[0], opt_result.fun)
+
+        #avg_p1 = numpy.average(self.fit_coeffs_["seq_weights"][0:-1])
+        #self.fit_coeffs_["seq_weights"] -= avg_p1
+        #self.fit_coeffs_["ind_b"] -= avg_p1
+
+        logging.info("last_opt iter: %03i fun: %.3f mse: %.3f", ic[0], opt_result.fun, eval_mse(opt_result.packed_x))
         
         return opt_result
     
     def fit(self, X, y):
+        from scipy.stats import gaussian_kde
         self.setup()
         
         self.fit_X_ = self.encode_seqs(X)
         self.fit_y_ = y
+
+        data_density=gaussian_kde(y)
+        data_y_range=numpy.linspace(min(y), max(y), 1000)
+        max_data_density=max(data_density(data_y_range))
+        
+        self.data_weights = numpy.clip( max_data_density / data_density(y), 1.0, self.max_data_upweight )
         
         self.fit_coeffs_ = numpy.zeros((), self.coeff_dtype)
         
         self.fit_coeffs_["weights"][self.flanking_window] = 1
-        if self.init_aas is None:
-            self.fit_coeffs_["seq_weights"] = 0
+        if self.init_aas:
+            self.fit_coeffs_["seq_weights"] = [1 if aa in self.init_aas else 0 for aa in (IUPAC.IUPACProtein.letters+'Z')]
         else:
-            self.fit_coeffs_["seq_weights"] = [1 if aa in self.init_aas else 0 for aa in IUPAC.IUPACProtein.letters]
+            self.fit_coeffs_["seq_weights"] = 0
 
-        self.fit_coeffs_["ind_w"] = -1
-        self.fit_coeffs_["ind_b"] = 0
-
-        self.fit_coeffs_["tot_l"] = 3.5
-        self.fit_coeffs_["tot_w"] = -1
-        self.fit_coeffs_["tot_b"] = 0
+        self.fit_coeffs_["ind_b"] = self.init_ind_b
+        self.fit_coeffs_["max_sumweight"] = self.init_max_sumweight
         
+
+        # Initialize tot_l to mean of observed values (GJR: not anymore)
+        self.fit_coeffs_["tot_l"] = self.init_tot_l #80 #numpy.mean( 3 ** self.fit_y_ )
+
         opt_cycles = [
-            ("seq_weights",), ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights",), ("seq_weights",), 
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights", "seq_weights"),
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l"), ("weights", "seq_weights"),
-            ("ind_w", "ind_b", "tot_w", "tot_b", "tot_l",   "weights", "seq_weights"),
+            ("seq_weights",),
+            ("ind_b","max_sumweight", "tot_l"),
+            ("seq_weights",),
+            ("weights", "seq_weights"),
+            ("ind_b","max_sumweight","tot_l"),
+            ("weights","seq_weights"),
+            ("ind_b", "tot_l", "max_sumweight"),
+            ("weights", "seq_weights", "max_sumweight"),
+            ("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
+
+            #12:42 sun dec 25 morning
+            #("seq_weights",),
+            #("ind_b","max_sumweight", "tot_l"),
+            #("weights", ),
+            #("seq_weights",),
+            #("ind_b","max_sumweight","tot_l"),
+            #("weights","seq_weights"),
+            #("ind_b", "tot_l", "max_sumweight"),
+            #("weights", "seq_weights", "max_sumweight"),
+            #("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
+
+            #("seq_weights","ind_b","tot_l","max_sumweight"),
+            #("weights","seq_weights"),
+            #("ind_b", "tot_l", "max_sumweight"),
+            #("seq_weights",), 
+            #("ind_b", "tot_l","max_sumweight"),
+            #("weights", "seq_weights", "max_sumweight"),
+            #("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
+
         ]
         
         for i, vset in enumerate(opt_cycles):
             logging.info("opt_cycle: %i vars: %s", i, vset)
-            self._last_opt_result = self.opt_cycle(vset, tol=5e-3)
+
+            self._last_opt_result = self.opt_cycle(
+                vset, tol=1e-3 if i < len(opt_cycles) - 1 else 2e-4 #2e-5
+            )
             
     def predict(self, X):
         return self.predict_fn(
@@ -232,7 +342,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
             **{n : self.fit_coeffs_[n] for n in self.fit_coeffs_.dtype.names}
         )
             
-    def eval_f(self, fname, X=None, y=None, coeffs = None):
+    def eval_f(self, fname, X=None, y=None, data_weights=None, coeffs = None):
         if coeffs is None:
             coeffs = self.fit_coeffs_
         if X is None:
@@ -242,8 +352,10 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin):
         
         if y is None:
             y = self.fit_y_
+        if data_weights is None:
+            data_weights = self.data_weights
         
-        return self.functions[fname](seq = X, targ = y, **{n : coeffs[n] for n in coeffs.dtype.names})
+        return self.functions[fname](seq = X, targ = y, data_weights = data_weights, **{n : coeffs[n] for n in coeffs.dtype.names})
 
 class TestDataGenerator(object):
     
