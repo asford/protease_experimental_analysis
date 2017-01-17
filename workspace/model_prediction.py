@@ -7,7 +7,8 @@ logging.basicConfig(
 )
 
 import pandas
-import numpy
+import numpy as np
+import scipy.stats
 
 import itertools
 from itertools import izip, product
@@ -40,14 +41,53 @@ def report_model_ec50(dataset, model_parameters, fit_parameters):
     counts_df = data.counts[dataset]
     counts_df['ec50'] = fit_parameters['sel_ec50']
 
-    cis = numpy.array([
+    cis = np.array([
         model.estimate_ec50_cred(fit_parameters, i, cred_spans=[.95])["cred_intervals"][.95]
         for i in range(len(counts_df))
     ])
 
+    predictions = {
+        p : {
+            k : ps[k](fit_parameters)
+            for k in ("fraction_selected", "selection_dist")
+        }
+        for p, ps in model.model_populations.items()
+    }
+
+    sum_llh=np.zeros(len(counts_df))
+    sum_signed_llh=np.zeros(len(counts_df))
+
+    for p, ps in predictions.items():
+        counts_df['downsamp_counts%s' % p] = model.population_data[p]['selected']
+        counts_df['pred_counts%s' % p] = np.round(model.population_data[p]['selected'].sum() * predictions[p]['selection_dist'])
+        bn=scipy.stats.binom(n=model.population_data[p]['selected'].sum(),p=predictions[p]['selection_dist'])
+        my_llh = bn.logpmf(counts_df['downsamp_counts%s' % p])
+        best_llh = bn.logpmf(counts_df['pred_counts%s' % p])
+        counts_df['delta_llh%s' % p] = my_llh - best_llh
+        counts_df['signed_delta_llh%s' % p] = counts_df['delta_llh%s' % p] * np.sign( counts_df['downsamp_counts%s' % p] - counts_df['pred_counts%s' % p]  )
+        sum_llh +=  counts_df['delta_llh%s' % p]
+        sum_signed_llh += counts_df['signed_delta_llh%s' % p]
+    counts_df['sum_delta_llh'] = sum_llh
+    counts_df['sum_signed_delta_llh'] = sum_signed_llh
+
     counts_df["ec50_95ci_lbound"] = cis[:,0]
     counts_df["ec50_95ci_ubound"] = cis[:,1]
     counts_df["ec50_95ci"] = cis[:,1] - cis[:,0]
+    counts_df['sel_k'] = dict(model_parameters)['sel_k'] # dict(model_parameters)['sel_k']
+
+
+    counts_df=counts_df[['name'] +
+                        ['counts%s' % p for p in sorted(model.population_data)] +
+                        ['downsamp_counts%s' % p for p in sorted(model.model_populations)] + 
+                        ['pred_counts%s' % p for p in sorted(model.model_populations)] +
+                        ['delta_llh%s' % p for p in sorted(model.model_populations)] + 
+                        ['signed_delta_llh%s' % p for p in sorted(model.model_populations)] +
+                        ['sel_k','sum_delta_llh','sum_signed_delta_llh','ec50_95ci_lbound','ec50_95ci_ubound',
+                         'ec50_95ci','ec50']]
+
+    counts_df.to_csv('%s.sel_k%s.erf.5e-7.%s.3cycles.fulloutput' % (dataset,dict(model_parameters)['sel_k'],dict(model_parameters)['min_selection_rate']),index=False,sep='\t')
+
+
 
     return counts_df
 
@@ -55,9 +95,17 @@ def report_model_ec50(dataset, model_parameters, fit_parameters):
 param_space = dict(
     response_fn = ("NormalSpaceErfResponse",),
     min_selection_mass = [5e-7],
+    min_selection_rate = [0.0001,0.00003],
+    outlier_detection_opt_cycles=[3],
+    sel_k=[0.8,2.0]
 )
 
+
+
 datasets = data.model_input.keys()
+datasets=['rd1_tryp','rd2_merge_tryp','rd3_merge_tryp','rd4_tryp','rd1_chymo','rd2_merge_chymo','rd3_merge_chymo','rd4_chymo',
+'ssm2_tryp','ssm2_chymo','rd2_tryp','rd2_redo_tryp','rd2_chymo','rd2_redo_chymo','rd3_tryp','rd3_redo_tryp','rd3_chymo','rd3_redo_chymo']
+print (datasets)
 
 parameter_sets = [frozenset(d.items()) for d in dict_product(param_space)]
 
