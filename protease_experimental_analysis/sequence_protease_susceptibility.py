@@ -30,9 +30,9 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
 
     max_data_upweight = traitlets.Float(default_value=1.0, allow_none=False, min=1.0)
 
-    init_tot_l = traitlets.Float(default_value=150.0, allow_none=False)
-    init_max_sumweight = traitlets.Float(default_value=80.0, allow_none=False)
-    init_ind_b = traitlets.Float(default_value=4.0, allow_none=False)
+    init_EC50_max = traitlets.Float(default_value=150.0, allow_none=False)
+    init_k_max = traitlets.Float(default_value=80.0, allow_none=False)
+    init_c0 = traitlets.Float(default_value=4.0, allow_none=False)
 
     flanking_window = traitlets.Integer(default_value=4, allow_none=False, min=0)
 
@@ -86,19 +86,19 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
         self.dat["data_weights"].tag.test_value = numpy.random.random(5)
         
         self.vs = {
-            "weights" : T.dmatrix("weights"),
-            "seq_weights" : T.dvector("seq_weights"),
-            "ind_b" : T.scalar("ind_b"),
-            "tot_l" : T.scalar("tot_l"),
-            "max_sumweight" : T.scalar("max_sumweight"),
+            "outer_PSSM" : T.dmatrix("outer_PSSM"),             
+            "P1_PSSM" : T.dvector("P1_PSSM"),
+            "c0" : T.scalar("c0"),
+            "EC50_max" : T.scalar("EC50_max"),
+            "k_max" : T.scalar("k_max"),
         }
         
         self.v_dtypes = {
-            "weights" : (float, (2 * self.flanking_window + 1, 21)),
-            "seq_weights" : (float, 21),
-            "ind_b" : (float, ()),
-            "tot_l" : (float, ()),
-            "max_sumweight" : (float, ()),
+            "outer_PSSM" : (float, (2 * self.flanking_window + 1, 21)),
+            "P1_PSSM" : (float, 21),
+            "c0" : (float, ()),
+            "EC50_max" : (float, ()),
+            "k_max" : (float, ()),
         }
 
         for v in self.vs:
@@ -137,8 +137,8 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
     
     def _build_model(self):
         
-        weights = self.vs["weights"]
-        seq_weights = self.vs["seq_weights"]
+        outer_PSSM = self.vs["outer_PSSM"]
+        P1_PSSM = self.vs["P1_PSSM"]
 
 
         window_size = self.flanking_window * 2 + 1
@@ -147,7 +147,7 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
         seq = self.dat["seq"]
             
         point_scores = [
-            weights[
+            outer_PSSM[
                 i,
                 seq[:, i:-(window_size - 1 - i) if i < window_size - 1 else None]
             ]
@@ -155,28 +155,26 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
         ]
 
         point_scores.append(
-            seq_weights[
+            P1_PSSM[
                 seq[:, self.flanking_window:-(self.flanking_window)]
             ]
 
         )
 
-        max_sumweight = self.vs["max_sumweight"]
+        k_max = self.vs["k_max"]
 
 
-        #pssm_score = T.clip(sum(point_scores), -9999, max_sumweight)
         pssm_score=sum(point_scores)
 
-        ind_b = self.vs["ind_b"]
+        c0 = self.vs["c0"]
 
         
-        ind_score = max_sumweight / (1.0 + T.exp(ind_b - pssm_score))
+        ind_score = k_max / (1.0 + T.exp(c0 - pssm_score)) # Eq. 19
         
-        tot_l = self.vs["tot_l"]
-        #todo asford Lift exponent into data?
+        EC50_max = self.vs["EC50_max"]
         
 
-        score = T.log(tot_l / (ind_score.sum(axis=-1) + 1)) / T.log(3)
+        score = T.log(EC50_max / (ind_score.sum(axis=-1) + 1)) / T.log(3) # Eq. 18, converted to a log EC50 instead of a raw EC50
         
         targ = self.dat["targ"]
         data_weights = self.dat["data_weights"]
@@ -186,10 +184,9 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
 
         error=T.clip(targ - score, error_lower_lim, error_upper_lim)
 
-        mse = T.mean(T.square(error) + (0.25 * T.abs_(targ - score)))
-        weighted_mse = T.sum((T.square(error) + (0.25 * T.abs_(targ - score)))* data_weights)  / T.sum(data_weights)
-        #todo asford l1/l2 loss per type, coeff per type?
-        regularization = (self.alpha_flank * T.square(weights[:,0:-1])).sum() + (self.alpha_center * T.abs_(seq_weights[0:-1])).sum()
+        mse = T.mean(T.square(error) + (0.25 * T.abs_(targ - score))) # Eq. 20
+        weighted_mse = T.sum((T.square(error) + (0.25 * T.abs_(targ - score)))* data_weights)  / T.sum(data_weights) #Eq. 20, including weights on the data (not used)
+        regularization = (self.alpha_flank * T.square(outer_PSSM[:,0:-1])).sum() + (self.alpha_center * T.abs_(P1_PSSM[0:-1])).sum()
 
         loss = weighted_mse + regularization
         loss_jacobian = dict(zip(self.vs, T.jacobian(loss, self.vs.values())))
@@ -261,9 +258,6 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
         for n in opt_result.packed_x.dtype.names:
             self.fit_coeffs_[n] = opt_result.packed_x[n]
 
-        #avg_p1 = numpy.average(self.fit_coeffs_["seq_weights"][0:-1])
-        #self.fit_coeffs_["seq_weights"] -= avg_p1
-        #self.fit_coeffs_["ind_b"] -= avg_p1
 
         logging.info("last_opt iter: %03i fun: %.3f mse: %.3f", ic[0], opt_result.fun, eval_mse(opt_result.packed_x))
         
@@ -284,48 +278,27 @@ class CenterLimitedPSSMModel(BaseEstimator, RegressorMixin, traitlets.HasTraits)
         
         self.fit_coeffs_ = numpy.zeros((), self.coeff_dtype)
         
-        self.fit_coeffs_["weights"][self.flanking_window] = 1
+        self.fit_coeffs_["outer_PSSM"][self.flanking_window] = 1
         if self.init_aas:
-            self.fit_coeffs_["seq_weights"] = [1 if aa in self.init_aas else 0 for aa in (IUPAC.IUPACProtein.letters+'Z')]
+            self.fit_coeffs_["P1_PSSM"] = [1 if aa in self.init_aas else 0 for aa in (IUPAC.IUPACProtein.letters+'Z')]
         else:
-            self.fit_coeffs_["seq_weights"] = 0
+            self.fit_coeffs_["P1_PSSM"] = 0
 
-        self.fit_coeffs_["ind_b"] = self.init_ind_b
-        self.fit_coeffs_["max_sumweight"] = self.init_max_sumweight
+        self.fit_coeffs_["c0"] = self.init_c0
+        self.fit_coeffs_["k_max"] = self.init_k_max
         
-
-        # Initialize tot_l to mean of observed values (GJR: not anymore)
-        self.fit_coeffs_["tot_l"] = self.init_tot_l #80 #numpy.mean( 3 ** self.fit_y_ )
+        self.fit_coeffs_["EC50_max"] = self.init_EC50_max 
 
         opt_cycles = [
-            ("seq_weights",),
-            ("ind_b","max_sumweight", "tot_l"),
-            ("seq_weights",),
-            ("weights", "seq_weights"),
-            ("ind_b","max_sumweight","tot_l"),
-            ("weights","seq_weights"),
-            ("ind_b", "tot_l", "max_sumweight"),
-            ("weights", "seq_weights", "max_sumweight"),
-            ("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
-
-            #12:42 sun dec 25 morning
-            #("seq_weights",),
-            #("ind_b","max_sumweight", "tot_l"),
-            #("weights", ),
-            #("seq_weights",),
-            #("ind_b","max_sumweight","tot_l"),
-            #("weights","seq_weights"),
-            #("ind_b", "tot_l", "max_sumweight"),
-            #("weights", "seq_weights", "max_sumweight"),
-            #("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
-
-            #("seq_weights","ind_b","tot_l","max_sumweight"),
-            #("weights","seq_weights"),
-            #("ind_b", "tot_l", "max_sumweight"),
-            #("seq_weights",), 
-            #("ind_b", "tot_l","max_sumweight"),
-            #("weights", "seq_weights", "max_sumweight"),
-            #("ind_b", "tot_l", "weights", "seq_weights", "max_sumweight"),
+            ("P1_PSSM",),
+            ("c0","k_max", "EC50_max"),
+            ("P1_PSSM",),
+            ("outer_PSSM", "P1_PSSM"),
+            ("c0","k_max","EC50_max"),
+            ("outer_PSSM","P1_PSSM"),
+            ("c0", "EC50_max", "k_max"),
+            ("outer_PSSM", "P1_PSSM", "k_max"),
+            ("c0", "EC50_max", "outer_PSSM", "P1_PSSM", "k_max"),
 
         ]
         

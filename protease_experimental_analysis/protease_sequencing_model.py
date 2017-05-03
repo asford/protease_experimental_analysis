@@ -29,11 +29,6 @@ from pymc3.distributions.continuous import bound
 
 from .utility import resolve_subclass, SubclassName
 
-default_selk_dict={'mid': dict(mu=1.63, sd=0.00002, w=1.02),
-           'low': dict(mu=1.53, sd=0.00002, w=1.15),
-           'high': dict(mu=1.75, sd=0.00002, w=0.9),
-           'lowest': dict(mu=1.48, sd=0.00002, w=1.20)}
-
 class FlatNormal(Continuous):
 
     def __init__(self, mu=0.0, w=0.0, tau=None, sd=None, *args, **kwargs):
@@ -83,14 +78,14 @@ class NormalSpaceErfResponse(SelectionResponseFn):
         return ["conc_factor"]
 
     def selection_mass_impl(self, num, sel_level, sel_k, sel_ec50, conc_factor):
-        sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)
-        
-        if num == numpy:
-            erf = scipy.special.erf
-        else:
-            erf = T.erf
+        sel_xs = sel_k * (conc_factor ** (sel_level - sel_ec50) - 1.0)   # Bracketed term of Eq. 10
+                                                                         # Note that [E]/EC_50 has been replaced by
+        if num == numpy:                                                 # conc_factor ** (sel_level - sel_ec50)
+            erf = scipy.special.erf                                      # because enzyme concentrations (sel_level)
+        else:                                                            # are passed to this function on a log scale, with the base
+            erf = T.erf                                                  # defined by conc_factor.
             
-        return (1.0 - erf(sel_xs)) / 2.0
+        return (1.0 - erf(sel_xs)) / 2.0                                 # The full Eq. 10
 
 class NormalSpaceLogisticResponse(SelectionResponseFn):
     @property
@@ -130,8 +125,6 @@ class FractionalSelectionModel(traitlets.HasTraits):
     #    kwargs.pop("__class__")
     #    return kwargs
 
-    sel_k_dict = traitlets.Enum(['mid','low','high','lowest'], default_value='mid')
-
     sel_k = traitlets.Float()#min_selection_rate
 
     min_selection_rate = traitlets.Union([
@@ -145,8 +138,6 @@ class FractionalSelectionModel(traitlets.HasTraits):
     ])
 
     homogenous_k = traitlets.Bool(default_value=True)
-
-    alex_opt = traitlets.Bool(default_value=False)
 
     outlier_detection_opt_cycles = traitlets.Integer(default_value=1)
 
@@ -196,7 +187,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
             if p["parent"] is None:
                 start_pop = init_pop
             else:
-                start_pop = populations[p["parent"]]["selected"]
+                start_pop = populations[p["parent"]]["P_sel"]
                 
             start_dist = unorm(start_pop)
             if p["selection_level"] is not None:
@@ -209,13 +200,13 @@ class FractionalSelectionModel(traitlets.HasTraits):
                 src_dist = start_dist
                 fraction_selected = 1
                 
-            selected = numpy.random.multinomial(p["selected"], unorm(src_dist)).astype(float)
+            selected = numpy.random.multinomial(p["P_sel"], unorm(src_dist)).astype(float)
             
             populations[pkey] = {}
             populations[pkey].update(p)
             populations[pkey].update({
-                "selected" : selected,
-                "fraction_selected" : fraction_selected
+                "P_sel" : selected,
+                "Frac_sel_pop" : fraction_selected
             })
             
         return populations
@@ -238,17 +229,17 @@ class FractionalSelectionModel(traitlets.HasTraits):
     def build_model(self, population_data):
         for k, p in population_data.items():
             unused_keys = set(p.keys()).difference(
-                ["selected", "fraction_selected", "selection_level", "parent"] +
+                ["P_sel", "Frac_sel_pop", "selection_level", "parent"] +
                 list(self.response_impl.population_params)
             )
             if unused_keys:
                 logger.warning("Unused keys in population_data[%r] : %s", k, unused_keys)
                 
-        num_members = set( len(p["selected"]) for p in population_data.values() )
+        num_members = set( len(p["P_sel"]) for p in population_data.values() )
         assert len(num_members) == 1, "Different observed population memberships: %s" % num_members
         self.num_members = num_members.pop()
         selected_observations = {
-            v["selection_level"] : v["selected"]
+            v["selection_level"] : v["P_sel"]
             for v in population_data.values() if v["selection_level"] is not None 
         }
 
@@ -278,7 +269,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
             #            "sel_k",
             #            FlatNormal.dist(**default_selk_dict[self.sel_k_dict]))
 
-            sel_k=self.sel_k
+            sel_k=self.sel_k 
 
             sel_values = set(
                 float(p["selection_level"])
@@ -326,7 +317,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
             else:
                 min_selection_mass = 0.0
         
-            for pidx, pkey in enumerate(self.modeled_populations):
+            for pidx, pkey in enumerate(self.modeled_populations): # Sum over all rounds as in Eq. 15
                 pdat = population_data[pkey]
                 p_min_selection_mass = (
                     min_selection_mass[pidx]
@@ -334,54 +325,57 @@ class FractionalSelectionModel(traitlets.HasTraits):
                     min_selection_mass
                 )
 
-                start_pop = population_data[pdat["parent"]]["selected"].astype(float)
-                start_dist = unorm(start_pop)
+                start_pop = population_data[pdat["parent"]]["P_sel"].astype(float)
+                P_in = unorm(start_pop)
 
                 if pdat["selection_level"] is not None:
-                    selection_mass_frac = self.response_impl.selection_mass(
-                        sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50,
-                        **{param : pdat[param] for param in self.response_impl.population_params}
-                    )
+                    Frac_sel = self.response_impl.selection_mass(                                  # Eq. 10, where "sel_k" is K_sel and 
+                        sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = sel_ec50,   # sel_ec50 is the vector of EC_50s, and
+                        **{param : pdat[param] for param in self.response_impl.population_params}  # selection_level is the enzyme "concentration" on a
+                    )                                                                              # log scale, with base specified in the input.
+                    
+                    Frac_sel_star = min_selection_rate + (Frac_sel * (1 - min_selection_rate))     # Eq. 11, with min_selection_rate as "a"
+                    P_cleave_prenormalized = P_in * Frac_sel_star    # The numerator of Eq. 12, normalized shortly
 
-                    selection_mass_frac = min_selection_rate + (selection_mass_frac * (1 - min_selection_rate))
+                    Frac_sel_pop = P_cleave_prenormalized.sum() / P_in.sum() # Precalculate this for Eq. 14
 
-                    selection_mass = start_dist * selection_mass_frac
 
-                    fraction_selected = selection_mass.sum() / start_dist.sum()
                 else:
-                    selection_mass_dist = start_dist
-                    fraction_selected = 1.0
+                    P_cleave = P_in
+                    Frac_sel_pop = 1.0
 
                 #multinomial formula returns nan if any p == 0, file bug?
-                # Add epsilon to selection prob to avoid nan-results when p==0
-                selection_dist = unorm(
-                    T.clip(selection_mass, (p_min_selection_mass + 1e-9) * fraction_selected, 1))
-                pop_mask = numpy.flatnonzero(start_pop > 0)
+                # Add epsilon to selection prob to avoid nan-results when p==0   
 
-                selected = pymc3.distributions.Multinomial(
-                    name = "selected_%s" % pkey,
-                    n=pdat["selected"][pop_mask].sum(),
-                    p=selection_dist[pop_mask],
-                    observed=pdat["selected"][pop_mask]
+                P_cleave = unorm(                                                                     # Finish calculating P_cleave per Eq. 12 by normalizingNormalize P_cleave and ensure all probabilities
+                    T.clip(P_cleave_prenormalized, (p_min_selection_mass + 1e-9) * Frac_sel_pop, 1))  # it to sum to 1. A lower threshold is added to all probabilities to
+                pop_mask = numpy.flatnonzero(start_pop > 0)                                           # prevent crashes. This low threshold is rarely relevant because
+
+                n_sel = pdat["P_sel"][pop_mask].sum()
+                selected = pymc3.distributions.Multinomial(     # Eq. 13
+                    name = "selected_%s" % pkey,                #
+                    n=n_sel ,                                   #
+                    p=P_cleave[pop_mask],
+                    observed=pdat["P_sel"][pop_mask]
                 )
                 
-                if pdat.get("fraction_selected", None) is not None:
-                    selected_count = pdat["selected"].sum()
-                    source_count = numpy.floor(float(selected_count) / pdat["fraction_selected"])
-                    total_selected = pymc3.distributions.Binomial(
-                        name = "total_selected_%s" % pkey,
-                        n = source_count,
-                        p = fraction_selected,
-                        observed = selected_count)
+                if pdat.get("Frac_sel_pop", None) is not None:
+                    n_sel = pdat["P_sel"].sum()                                      
+                    n_assay = numpy.floor(float(n_sel) / pdat["Frac_sel_pop"])
+                    total_selected = pymc3.distributions.Binomial(    #
+                        name = "total_selected_%s" % pkey,            # Eq. 14
+                        n = n_assay,                                  #
+                        p = Frac_sel_pop,                             #
+                        observed = n_sel)                             #
                 else:
-                    total_selected = pdat["selected"].sum()
+                    total_selected = pdat["P_sel"].sum()
                     
                 self.model_populations[pkey] = {
-                    "selection_mass" : self._function(selection_mass),
-                    "selection_dist" : self._function(selection_dist),
-                    "fraction_selected" : self._function(fraction_selected),
-                    "selected" : self._function(selected),
-                    "total_selected" : self._function(total_selected),
+                    "selection_mass" : self._function(P_cleave * Frac_sel_pop),
+                    "P_cleave" : self._function(P_cleave),
+                    "Frac_sel_pop" : self._function(Frac_sel_pop),
+                    "P_sel" : self._function(selected),
+                    "n_sel" : self._function(total_selected),
                 }
                 
         self.fit_params = { k : self._function(v) for k, v in self.fit_params.items() }
@@ -399,32 +393,6 @@ class FractionalSelectionModel(traitlets.HasTraits):
         MAP = pymc3.find_MAP(start=start, model=self.model, fmin=scipy.optimize.fmin_l_bfgs_b)
         
         return { k : v(MAP) for k, v in self.fit_params.items() }
-    
-    def opt_ec50_cred_outliers_alex(self, src_params):
-        logger.info("scan_ec50_outliers: %i members", self.num_members)
-        params = copy.deepcopy(src_params)
-
-        num_outlier = 0
-        for i in range(self.num_members):
-            if i % 1000 == 0:
-                logger.info("scan_ec50_outliers: %i / %i", i, self.num_members)
-                
-            cred_summary = self.estimate_ec50_cred(params, i)
-
-            xs = cred_summary["xs"]
-            cdf = cred_summary["cdf"]
-
-            cur_i = numpy.searchsorted(xs, params["sel_ec50"][i])
-            l_b = numpy.searchsorted(cdf, .25, side="left")
-            u_b = numpy.searchsorted(cdf, .75, side="right")
-
-            if cur_i < l_b or cur_i > u_b:
-                num_outlier += 1
-                #Clip back into self.sel_range
-                params["sel_ec50"][i] = numpy.clip(
-                    cred_summary["xs"][int((l_b + u_b) / 2)],
-                    self.sel_range["lower"] + .1,
-                    self.sel_range["upper"] - .1)
 
     def opt_ec50_cred_outliers(self, src_params):
         logger.info("scan_ec50_outliers: %i members", self.num_members)
@@ -456,10 +424,8 @@ class FractionalSelectionModel(traitlets.HasTraits):
         params = self.optimize_params(start)
 
         for _ in range(self.outlier_detection_opt_cycles):
-            if self.alex_opt:
-                resampled = self.opt_ec50_cred_outliers_alex(params)
-            else:
-                resampled = self.opt_ec50_cred_outliers(params)
+
+            resampled = self.opt_ec50_cred_outliers(params)
             params = self.optimize_params(resampled)
 
         return params 
@@ -492,7 +458,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
                 min_selection_mass
             )
             
-            parent_pop_fraction = unorm(self.population_data[pdat['parent']]['selected'])[sample_i]
+            parent_pop_fraction = unorm(self.population_data[pdat['parent']]["P_sel"])[sample_i]
             
             if parent_pop_fraction == 0:
                 continue
@@ -511,15 +477,15 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
             selected_fraction = min_selection_rate + (selected_fraction * (1 - min_selection_rate))
 
-            sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]['fraction_selected'](base_params)
+            sel_pop_fraction = parent_pop_fraction * selected_fraction / self.model_populations[pkey]["Frac_sel_pop"](base_params)
             
             sample_llhs = scipy.stats.binom.logpmf(
-                pdat['selected'][sample_i],
-                n=pdat['selected'].sum(),
+                pdat["P_sel"][sample_i],
+                n=pdat["P_sel"].sum(),
                 p=numpy.clip(sel_pop_fraction, p_min_selection_mass + 1e-9, 1.0)
             )
 
-            if include_global_terms and pdat.get("fraction_selected") is not None:
+            if include_global_terms and pdat.get("Frac_sel_pop") is not None:
                 prev_selected_fraction = self.response_impl.selection_mass(
                     sel_level = pdat["selection_level"], sel_k = sel_k, sel_ec50 = base_params['sel_ec50'][sample_i],
                     **{param : pdat[param] for param in self.response_impl.population_params}
@@ -529,11 +495,11 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
                 selected_mass = parent_pop_fraction * selected_fraction
 
-                selected_count = pdat["selected"].sum()
-                source_count = numpy.floor(float(selected_count) / pdat["fraction_selected"])
+                selected_count = pdat["P_sel"].sum()
+                source_count = numpy.floor(float(selected_count) / pdat["Frac_sel_pop"])
 
                 modified_global_selection_fractions = (
-                    self.model_populations[pkey]['fraction_selected'](base_params)
+                    self.model_populations[pkey]["Frac_sel_pop"](base_params)
                     + selected_mass - prev_selected_mass
                 )
             
@@ -594,9 +560,9 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
         return {
             pkey : {
-                "selected"  : self.population_data[pkey]["selected"],
-                "selected_fraction" : normed_pop(self.population_data[pkey]["selected"].astype(float)),
-                "pop_fraction" : normed_pop(self.model_populations[pkey]["selection_dist"](params))
+                "P_sel"  : self.population_data[pkey]["P_sel"],
+                "selected_fraction" : normed_pop(self.population_data[pkey]["P_sel"].astype(float)),
+                "P_cleave" : normed_pop(self.model_populations[pkey]["P_cleave"](params))
             }
             for pkey in self.model_populations
         }
@@ -613,7 +579,7 @@ class FractionalSelectionModel(traitlets.HasTraits):
             for k, p in model.population_data.items()}
         
         sel_fracs = {
-            k : p["selected"][i] / p["selected"].sum()
+            k : p["P_sel"][i] / p["P_sel"].sum()
             for k, p in model.population_data.items()}
         
         pylab.xticks(
@@ -632,10 +598,10 @@ class FractionalSelectionModel(traitlets.HasTraits):
         
         lbl = False
         for k in sel_sum:
-            n = sel_sum[k]["selected"].sum()
+            n = sel_sum[k]["P_sel"].sum()
             p = sel_sum[k]["pop_fraction"][i]
             sel_level = model.population_data[k]["selection_level"]
-            counts=sel_sum[k]["selected"][i]
+            counts=sel_sum[k]["P_sel"][i]
             plt.text(sel_levels[k] + 0.2, sel_fracs[k], '%.0f' % counts)
             
             if p<=0:
@@ -677,19 +643,19 @@ class FractionalSelectionModel(traitlets.HasTraits):
 
         for v in selection_summary.values():
             logpmf = scipy.stats.binom.logpmf(
-                v["selected"],
-                n=v["selected"].sum(),
-                p=v["pop_fraction"])
+                v["P_sel"],
+                n=v["P_sel"].sum(),
+                p=v["P_cleave"])
             
             max_logpmf = scipy.stats.binom.logpmf(
-                numpy.round(v["selected"].sum() * v["pop_fraction"]),
-                n=v["selected"].sum(),
-                p=v["pop_fraction"])
+                numpy.round(v["P_sel"].sum() * v["P_cleave"]),
+                n=v["P_sel"].sum(),
+                p=v["P_cleave"])
 
             sel_llh = logpmf - max_logpmf
             v["sel_log_likelihood"] = numpy.where(sel_llh != -numpy.inf, sel_llh, numpy.nan)
 
-            sel_error = (v["selected"] / v["selected"].sum()) - v["pop_fraction"]
+            sel_error = (v["P_sel"] / v["P_sel"].sum()) - v["P_cleave"]
             v["sel_log_likelihood_signed"] = -v["sel_log_likelihood"] * numpy.sign(sel_error) 
 
         return selection_summary

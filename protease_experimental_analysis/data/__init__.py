@@ -47,11 +47,11 @@ for i, r in summary.iterrows():
         parent            = r['parent'],
         selection_level   = r['selection_strength'],
         num_selected      = fix_num_selected(r['cells_collected']),
-        fraction_selected = none_or_div(r['fraction_collected'], r['parent_expression']),
+        Frac_sel_pop = none_or_div(r['fraction_collected'], r['parent_expression']),
         conc_factor       = r['conc_factor']
     )
-    if model_input[name][rnd]['fraction_selected'] != None:
-        model_input[name][rnd]['fraction_selected'] *= r['matching_sequences']
+    if model_input[name][rnd]['Frac_sel_pop'] != None:
+        model_input[name][rnd]['Frac_sel_pop'] *= r['matching_sequences']
     if r['matching_sequences'] != None:
         model_input[name][rnd]['num_selected']  *= r['matching_sequences']
 
@@ -74,8 +74,8 @@ for exper in model_input:
     for k, v in model_input[exper].items():
         if v["seq_counts"].sum() > v["num_selected"]: 
             pfrac = v["seq_counts"].values.astype(float) / v['seq_counts'].sum()
-            v["selected"] = np.floor(pfrac * v["num_selected"])
+            v["P_sel"] = np.floor(pfrac * v["num_selected"])
         else:
             v["num_selected"] = v["seq_counts"].sum()
-            v["selected"] = np.array(v["seq_counts"].astype(np.float))
+            v["P_sel"] = np.array(v["seq_counts"].astype(np.float))
         v['min_fraction'] = None
